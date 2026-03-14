@@ -13,11 +13,23 @@ st.title("🧪📄📄 E2B_R3 Two‑File Comparator — Tabular, Box‑wise")
 # ---------------- Utilities ----------------
 NS = {'hl7': 'urn:hl7-org:v3', 'xsi': 'http://www.w3.org/2001/XMLSchema-instance'}
 UNKNOWN_TOKENS = {"unk", "asku", "unknown"}
-SENDER_ID_OID = "2.16.840.1.113883.3.989.2.1.3.1"
-WWID_OID     = "2.16.840.1.113883.3.989.2.1.3.2"  # your 'WWID'
-FIRST_SENDER_OID = "2.16.840.1.113883.3.989.2.1.1.3"  # First sender of case
-FIRST_SENDER_MAP = {"1": "Regulator", "2": "Other"}
 
+# Admin identifiers
+SENDER_ID_OID      = "2.16.840.1.113883.3.989.2.1.3.1"  # Sender ID
+WWID_OID           = "2.16.840.1.113883.3.989.2.1.3.2"  # WWID (as per your definition)
+FIRST_SENDER_OID   = "2.16.840.1.113883.3.989.2.1.1.3"  # First sender of case (1=Regulator,2=Other)
+FIRST_SENDER_MAP   = {"1": "Regulator", "2": "Other"}
+
+# Reporter mapping (same coding you use)
+REPORTER_MAP = {
+    "1": "Physician",
+    "2": "Pharmacist",
+    "3": "Other health professional",
+    "4": "Lawyer",
+    "5": "Consumer or other non-health professional",
+}
+
+# TD priority search paths (tuned for E2B/HL7 v3 flavors)
 TD_PATHS = [
     './/hl7:transmissionWrapper/hl7:creationTime',
     './/hl7:ControlActProcess/hl7:effectiveTime',
@@ -33,7 +45,7 @@ BOX_CSS = """
   background: #fafafa;
 }
 .box h5 { margin: 0 0 8px 0; }
-.diff { color: #b00020; font-weight: 600; } /* red text for mismatches */
+.diff { color: #b00020; font-weight: 600; }
 .smallnote { color:#666; font-size: 0.9em; }
 </style>
 """
@@ -119,9 +131,6 @@ def extract_wwid(root: ET.Element) -> str:
     return extract_id_by_oid(root, WWID_OID)
 
 def extract_first_sender_type(root: ET.Element) -> str:
-    """
-    Finds the first <code> with codeSystem = FIRST_SENDER_OID and returns a mapped label.
-    """
     for el in root.iter():
         local = el.tag.split('}')[-1] if '}' in el.tag else el.tag
         if local == 'code' and el.attrib.get('codeSystem') == FIRST_SENDER_OID:
@@ -325,6 +334,28 @@ def extract_events(root: ET.Element) -> List[Dict[str, Any]]:
             })
     return out
 
+# -------- Reporter extraction (new section) --------
+def extract_reporter(root: ET.Element) -> Dict[str, str]:
+    """
+    Pulls a basic reporter profile:
+      - Reporter Qualification (mapped 1..5)
+      - Reporter Country, Reporter City (if present)
+    """
+    # Qualification
+    qual_elem = find_first(root, './/hl7:asQualifiedEntity/hl7:code')
+    qual_code = qual_elem.attrib.get('code', '') if qual_elem is not None else ''
+    qualification = REPORTER_MAP.get(qual_code, "")
+
+    # Country and City/Town (if provided under reporter address)
+    country_elem = find_first(root, './/hl7:asQualifiedEntity/hl7:addr/hl7:country')
+    city_elem    = find_first(root, './/hl7:asQualifiedEntity/hl7:addr/hl7:city')
+
+    return {
+        "Reporter Qualification": clean_value(qualification),
+        "Reporter Country": get_text(country_elem),
+        "Reporter City/Town": get_text(city_elem),
+    }
+
 def extract_narrative(root: ET.Element) -> str:
     narrative_elem = root.find('.//hl7:code[@code="PAT_ADV_EVNT"]/../hl7:text', NS)
     return clean_value(narrative_elem.text if narrative_elem is not None else '')
@@ -335,10 +366,14 @@ def extract_model(xml_bytes: bytes) -> Dict[str, Any]:
     except Exception as e:
         return {"_error": f"XML parse error: {e}"}
     model: Dict[str, Any] = {}
+    # Admin
     model["Sender ID"] = extract_sender_id(root)
     model["WWID"] = extract_wwid(root)
     model["First Sender Type"] = extract_first_sender_type(root)
     model.update(extract_td_frd_lrd(root))  # TD/FRD/LRD (raw & formatted)
+    # Reporter (new)
+    model["Reporter"] = extract_reporter(root)
+    # Patient / Products / Events / Narrative
     model["Patient"] = extract_patient(root)
     model["Products"] = extract_products(root)
     model["Events"] = extract_events(root)
@@ -347,29 +382,17 @@ def extract_model(xml_bytes: bytes) -> Dict[str, Any]:
 
 # --------------- Helpers to build comparison tables (ONLY non-blank rows) ----------------
 def compare_table(rows: List[Tuple[str, str, str]], treat_as_dates: bool = False) -> pd.DataFrame:
-    """
-    rows = [(Field, source_value, processed_value), ...]
-    - Skips any row where BOTH source and processed are blank.
-    - Adds 🔴 marker on processed when values differ (date-equivalent differences are not marked if treat_as_dates=True).
-    """
     disp = []
     for field, s, p in rows:
         s_str = (s or "").strip()
         p_str = (p or "").strip()
         if not s_str and not p_str:
-            continue  # skip fully blank row
+            continue
         marker = mismatch_marker(s, p, is_date=treat_as_dates)
         disp.append({"Field": field, "Source": safe_disp(s_str), "Processed": safe_disp(p_str) + marker})
     return pd.DataFrame(disp) if disp else pd.DataFrame(columns=["Field","Source","Processed"])
 
 def make_admin_table(src: Dict[str,Any], prc: Dict[str,Any]) -> pd.DataFrame:
-    """
-    Admin/Header section shows:
-      1) Sender ID
-      2) WWID
-      3) First Sender Type (codeSystem 2.16.840.1.113883.3.989.2.1.1.3 → 1=Regulator, 2=Other)
-      4) Day Zero = Source: TD   |   Processed: LRD
-    """
     rows: List[Tuple[str, str, str]] = []
     rows.append(("Sender ID", src.get("Sender ID",""), prc.get("Sender ID","")))
     rows.append(("WWID", src.get("WWID",""), prc.get("WWID","")))
@@ -378,13 +401,20 @@ def make_admin_table(src: Dict[str,Any], prc: Dict[str,Any]) -> pd.DataFrame:
     prc_lrd_disp = prc.get("LRD", "") or format_date(prc.get("LRD_raw", ""))
     rows.append(("Day Zero", src_td_disp, prc_lrd_disp))
 
-    df_sender = compare_table([rows[0]], treat_as_dates=False)
-    df_wwid   = compare_table([rows[1]], treat_as_dates=False)
-    df_first  = compare_table([rows[2]], treat_as_dates=False)
-    df_day0   = compare_table([rows[3]], treat_as_dates=True)
-
-    parts = [df for df in [df_sender, df_wwid, df_first, df_day0] if df is not None and not df.empty]
+    # dates treated as dates only for Day Zero
+    parts = [
+        compare_table([rows[0]], treat_as_dates=False),
+        compare_table([rows[1]], treat_as_dates=False),
+        compare_table([rows[2]], treat_as_dates=False),
+        compare_table([rows[3]], treat_as_dates=True)
+    ]
+    parts = [df for df in parts if df is not None and not df.empty]
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["Field","Source","Processed"])
+
+def make_reporter_table(src: Dict[str,str], prc: Dict[str,str]) -> pd.DataFrame:
+    fields = ["Reporter Qualification", "Reporter Country", "Reporter City/Town"]
+    rows = [(f, src.get(f,""), prc.get(f,"")) for f in fields]
+    return compare_table(rows, treat_as_dates=False)
 
 def make_patient_table(src: Dict[str,str], prc: Dict[str,str]) -> pd.DataFrame:
     fields = ["Gender","Age","Age Group","Height","Weight","Initials"]
@@ -467,13 +497,21 @@ if src.get("_error") or prc.get("_error"):
     st.error(f"Source error: {src.get('_error','-')}\nProcessed error: {prc.get('_error','-')}")
     st.stop()
 
-# ---------------- SECTION: Admin/Header (Sender ID + WWID + First Sender Type + Day Zero) ----------------
+# ---------------- SECTION: Admin/Header ----------------
 st.subheader("Admin / Header")
 admin_df = make_admin_table(src, prc)
 if admin_df.empty:
     st.markdown('<div class="box smallnote">No header/admin values present in either file.</div>', unsafe_allow_html=True)
 else:
     st.table(admin_df)
+
+# ---------------- SECTION: Reporter (NEW) ----------------
+st.subheader("Reporter")
+rep_df = make_reporter_table(src.get("Reporter",{}), prc.get("Reporter",{}))
+if rep_df.empty:
+    st.markdown('<div class="box smallnote">No reporter details present in either file.</div>', unsafe_allow_html=True)
+else:
+    st.table(rep_df)
 
 # ---------------- SECTION: Patient Details ----------------
 st.subheader("Patient Details")
@@ -540,9 +578,10 @@ else:
     st.code((prc_narr or "—") + suffix)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ---------------- Export (only non-blank rows) ----------------
+# ---------------- Export (robust Excel engine handling) ----------------
 st.markdown("---")
 st.markdown("### ⬇️ Download Comparison (Excel)")
+
 def rows_from_table(df: pd.DataFrame, section: str) -> List[Dict[str,str]]:
     out = []
     if df is None or df.empty:
@@ -551,7 +590,8 @@ def rows_from_table(df: pd.DataFrame, section: str) -> List[Dict[str,str]]:
         out.append({"Section": section, "Field": r["Field"], "Source": r["Source"], "Processed": r["Processed"]})
     return out
 
-admin_rows = rows_from_table(admin_df, "Admin/Header")  # includes Sender ID, WWID, First Sender Type, Day Zero
+admin_rows = rows_from_table(admin_df, "Admin/Header")
+reporter_rows = rows_from_table(rep_df, "Reporter")
 pat_rows = rows_from_table(pat_df, "Patient")
 
 # Drugs sheet
@@ -578,15 +618,40 @@ for key in all_evt_keys:
         if has_value(s_val) or has_value(p_val):
             evt_rows.append({"Section":"Event", "Group": title, "Field": field, "Source": s_val or "—", "Processed": p_val or "—"})
 
-excel_buffer = io.BytesIO()
-with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-    pd.DataFrame(admin_rows + pat_rows).to_excel(writer, index=False, sheet_name="Admin_Patient")
+def build_excel_bytes() -> Optional[bytes]:
+    sheets: Dict[str, pd.DataFrame] = {}
+    sheets["Admin_Reporter_Patient"] = pd.DataFrame(admin_rows + reporter_rows + pat_rows)
     if prod_rows:
-        pd.DataFrame(prod_rows).to_excel(writer, index=False, sheet_name="Drugs")
+        sheets["Drugs"] = pd.DataFrame(prod_rows)
     if evt_rows:
-        pd.DataFrame(evt_rows).to_excel(writer, index=False, sheet_name="Events")
+        sheets["Events"] = pd.DataFrame(evt_rows)
     if has_value(src.get("Narrative","")) or has_value(prc.get("Narrative","")):
-        pd.DataFrame([{"Source Narrative": src.get("Narrative","") or "—",
-                       "Processed Narrative": prc.get("Narrative","") or "—"}]).to_excel(writer, index=False, sheet_name="Narrative")
+        sheets["Narrative"] = pd.DataFrame([{
+            "Source Narrative": src.get("Narrative","") or "—",
+            "Processed Narrative": prc.get("Narrative","") or "—"
+        }])
 
-st.download_button("Download qc_twofile_compare_tabular.xlsx", excel_buffer.getvalue(), "qc_twofile_compare_tabular.xlsx")
+    excel_buffer = io.BytesIO()
+    # Try openpyxl, then xlsxwriter
+    for engine in ("openpyxl", "xlsxwriter"):
+        try:
+            with pd.ExcelWriter(excel_buffer, engine=engine) as writer:
+                for name, df in sheets.items():
+                    df.to_excel(writer, index=False, sheet_name=name)
+            return excel_buffer.getvalue()
+        except ModuleNotFoundError:
+            continue
+        except Exception as e:
+            st.warning(f"Excel export using engine='{engine}' failed: {e}")
+            continue
+    return None
+
+excel_bytes = build_excel_bytes()
+if excel_bytes:
+    st.download_button("Download qc_twofile_compare_tabular.xlsx", excel_bytes, "qc_twofile_compare_tabular.xlsx")
+else:
+    st.error(
+        "Excel export failed because neither 'openpyxl' nor 'xlsxwriter' is available. "
+        "Add one of these to your environment (requirements.txt) and redeploy.\n\n"
+        "Example:\n  openpyxl>=3.1.0\n  # or\n  XlsxWriter>=3.1.0"
+    )
