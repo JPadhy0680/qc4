@@ -1,0 +1,16 @@
+{
+  "fields": [
+    {
+      "name": "case_id",
+      "type": "string",
+      "source": {
+        "method": "regex",
+        "pattern": "Case\\s*ID[:\\s]*([A-Za-z0-9_-]+)",
+        "flags": ["IGNORECASE", "MULTILINE"]
+      },
+      "xml": { "xpath": ".//Case/ID" },
+      "normalize": ["strip"],
+      "comparison": { "mode": "exact" }
+    }
+  ]
+}
