@@ -553,4 +553,4 @@ with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
                        "Processed Narrative": prc.get("Narrative","") or "—"}]).to_excel(writer, index=False, sheet_name="Narrative")
 
 st.download_button("Download qc_twofile_compare_tabular.xlsx", excel_buffer.getvalue(), "qc_twofile_compare_tabular.xlsx")
-``
+
