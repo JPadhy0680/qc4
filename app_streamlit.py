@@ -15,12 +15,12 @@ NS = {'hl7': 'urn:hl7-org:v3', 'xsi': 'http://www.w3.org/2001/XMLSchema-instance
 UNKNOWN_TOKENS = {"unk", "asku", "unknown"}
 
 # Admin identifiers
-SENDER_ID_OID      = "2.16.840.1.113883.3.989.2.1.3.1"  # Sender ID
-WWID_OID           = "2.16.840.1.113883.3.989.2.1.3.2"  # WWID (as per your definition)
-FIRST_SENDER_OID   = "2.16.840.1.113883.3.989.2.1.1.3"  # First sender of case (1=Regulator,2=Other)
+SENDER_ID_OID      = "2.16.840.1.113883.3.989.2.1.3.1"   # Sender ID
+WWID_OID           = "2.16.840.1.113883.3.989.2.1.3.2"   # WWID
+FIRST_SENDER_OID   = "2.16.840.1.113883.3.989.2.1.1.3"   # First sender of case (1=Regulator, 2=Other)
 FIRST_SENDER_MAP   = {"1": "Regulator", "2": "Other"}
 
-# Reporter mapping (same coding you use)
+# Reporter qualification mapping (as in your triage app)
 REPORTER_MAP = {
     "1": "Physician",
     "2": "Pharmacist",
@@ -29,7 +29,7 @@ REPORTER_MAP = {
     "5": "Consumer or other non-health professional",
 }
 
-# TD priority search paths (tuned for E2B/HL7 v3 flavors)
+# TD priority paths (for Day Zero: Source=TD, Processed=LRD)
 TD_PATHS = [
     './/hl7:transmissionWrapper/hl7:creationTime',
     './/hl7:ControlActProcess/hl7:effectiveTime',
@@ -37,7 +37,7 @@ TD_PATHS = [
     './/hl7:creationTime',
 ]
 
-# --- styling (simple card / box) ---
+# --- UI styling ---
 BOX_CSS = """
 <style>
 .box {
@@ -45,12 +45,12 @@ BOX_CSS = """
   background: #fafafa;
 }
 .box h5 { margin: 0 0 8px 0; }
-.diff { color: #b00020; font-weight: 600; }
 .smallnote { color:#666; font-size: 0.9em; }
 </style>
 """
 st.markdown(BOX_CSS, unsafe_allow_html=True)
 
+# ---------------- Small helpers ----------------
 def _digits_only(s: str) -> str:
     return re.sub(r"\D", "", (s or "").strip())
 
@@ -236,8 +236,7 @@ def extract_products(root: ET.Element) -> List[Dict[str, str]]:
     for drug in findall(root, './/hl7:substanceAdministration'):
         id_elem = find_first(drug, './/hl7:id')
         drug_id = id_elem.attrib.get('root','') if id_elem is not None else ''
-        if drug_id in suspects:  # only suspects
-            # name
+        if drug_id in suspects:
             nm = find_first(drug, './/hl7:kindOfProduct/hl7:name')
             raw_name = ""
             if nm is not None:
@@ -249,18 +248,15 @@ def extract_products(root: ET.Element) -> List[Dict[str, str]]:
                 alt = find_first(drug, './/hl7:manufacturedProduct/hl7:name')
                 raw_name = get_text(alt)
 
-            # dose text/value/unit
             txt = get_text(find_first(drug, './/hl7:text'))
             dq = find_first(drug, './/hl7:doseQuantity')
             dose_v = dq.attrib.get('value','') if dq is not None else ''
             dose_u = dq.attrib.get('unit','') if dq is not None else ''
 
-            # dates
             low = find_first(drug, './/hl7:low'); high = find_first(drug, './/hl7:high')
             sd_raw = low.attrib.get('value','') if low is not None else ''
             ed_raw = high.attrib.get('value','') if high is not None else ''
 
-            # form / lot / MAH
             form = get_text(find_first(drug, './/hl7:formCode/hl7:originalText'))
             lot = get_text(find_first(drug, './/hl7:lotNumberText'))
             mah = ""
@@ -283,7 +279,7 @@ def extract_products(root: ET.Element) -> List[Dict[str, str]]:
                 "Formulation": clean_value(form),
                 "Lot No": clean_value(lot),
                 "MAH": clean_value(mah),
-                "_key": normalize_text(raw_name) if raw_name else "",  # matching key
+                "_key": normalize_text(raw_name) if raw_name else "",
             })
     return products
 
@@ -334,26 +330,149 @@ def extract_events(root: ET.Element) -> List[Dict[str, Any]]:
             })
     return out
 
-# -------- Reporter extraction (new section) --------
-def extract_reporter(root: ET.Element) -> Dict[str, str]:
+# -------- Reporter extraction (QC: all available details) --------
+def extract_reporter_full(root: ET.Element) -> Dict[str, str]:
     """
-    Pulls a basic reporter profile:
-      - Reporter Qualification (mapped 1..5)
-      - Reporter Country, Reporter City (if present)
+    Returns a dict with as many reporter details as available.
+    We pick the first 'asQualifiedEntity' block that carries reporter info.
     """
+    # Locate a plausible reporter node
+    reporter_node = None
+    for cand in findall(root, './/hl7:asQualifiedEntity'):
+        if cand is not None:
+            reporter_node = cand
+            break
+    if reporter_node is None:
+        return {  # empty structure to keep order consistent
+            "Reporter Qualification": "",
+            "Reporter IDs": "",
+            "Reporter Name (Full)": "",
+            "Reporter Given Name(s)": "",
+            "Reporter Family Name": "",
+            "Reporter Organization": "",
+            "Reporter Street": "",
+            "Reporter City/Town": "",
+            "Reporter State/Province": "",
+            "Reporter Postal Code": "",
+            "Reporter Country": "",
+            "Reporter Phone(s)": "",
+            "Reporter Email(s)": "",
+            "Reporter Fax(es)": "",
+        }
+
     # Qualification
-    qual_elem = find_first(root, './/hl7:asQualifiedEntity/hl7:code')
+    qual_elem = reporter_node.find('hl7:code', NS)
     qual_code = qual_elem.attrib.get('code', '') if qual_elem is not None else ''
     qualification = REPORTER_MAP.get(qual_code, "")
 
-    # Country and City/Town (if provided under reporter address)
-    country_elem = find_first(root, './/hl7:asQualifiedEntity/hl7:addr/hl7:country')
-    city_elem    = find_first(root, './/hl7:asQualifiedEntity/hl7:addr/hl7:city')
+    # IDs (collect all under reporter node)
+    id_elems = reporter_node.findall('.//hl7:id', NS)
+    ids = []
+    for el in id_elems:
+        ext = clean_value(el.attrib.get('extension',''))
+        rt  = clean_value(el.attrib.get('root',''))
+        if ext and rt:
+            ids.append(f"{ext} ({rt})")
+        elif ext:
+            ids.append(ext)
+        elif rt:
+            ids.append(rt)
+    ids_text = "; ".join(dict.fromkeys(ids))  # unique-preserving order
+
+    # Name (try several common paths)
+    name_paths = [
+        './/hl7:assignedEntity/hl7:assignedPerson/hl7:name',
+        './/hl7:assignedPerson/hl7:name',
+        './/hl7:person/hl7:name',
+        './/hl7:name',
+    ]
+    name_elem = None
+    for p in name_paths:
+        cand = reporter_node.find(p, NS)
+        if cand is not None:
+            name_elem = cand
+            break
+    given_names, family_name, name_full = [], "", ""
+    if name_elem is not None:
+        for g in name_elem.findall('hl7:given', NS):
+            if g.text and g.text.strip():
+                given_names.append(g.text.strip())
+        fam = name_elem.find('hl7:family', NS)
+        if fam is not None and fam.text and fam.text.strip():
+            family_name = fam.text.strip()
+        # Full name: prefer concatenation of parts; fallback to raw text
+        parts = given_names + ([family_name] if family_name else [])
+        name_full = " ".join(parts).strip() or get_text(name_elem)
+
+    # Organization
+    org_paths = [
+        './/hl7:assignedEntity/hl7:representedOrganization/hl7:name',
+        './/hl7:representedOrganization/hl7:name',
+        './/hl7:scopingOrganization/hl7:name',
+    ]
+    org_name = ""
+    for p in org_paths:
+        node = reporter_node.find(p, NS)
+        if node is not None and get_text(node):
+            org_name = get_text(node)
+            break
+
+    # Address
+    addr = reporter_node.find('.//hl7:addr', NS)
+    street_lines = []
+    city = state = postal = country = ""
+    if addr is not None:
+        for sl in addr.findall('hl7:streetAddressLine', NS):
+            if sl.text and sl.text.strip():
+                street_lines.append(sl.text.strip())
+        city_el = addr.find('hl7:city', NS)
+        if city_el is not None: city = get_text(city_el)
+        st_el = addr.find('hl7:state', NS)
+        if st_el is not None: state = get_text(st_el)
+        pc_el = addr.find('hl7:postalCode', NS)
+        if pc_el is not None: postal = get_text(pc_el)
+        co_el = addr.find('hl7:country', NS)
+        if co_el is not None: country = get_text(co_el)
+    street = ", ".join(street_lines)
+
+    # Telecom: collect phones/emails/faxes
+    phones, emails, faxes = [], [], []
+    for tel in reporter_node.findall('.//hl7:telecom', NS):
+        val = (tel.attrib.get('value') or "").strip()
+        use = (tel.attrib.get('use') or "").upper()
+        if not val:
+            continue
+        v = val.lower()
+        if v.startswith('mailto:'):
+            emails.append(val.split(':',1)[1])
+        elif 'fax' in use or v.startswith('fax:'):
+            faxes.append(val.split(':',1)[-1] if ':' in val else val)
+        elif v.startswith('tel:') or v.startswith('tel;'):
+            phones.append(val.split(':',1)[1] if ':' in val else val)
+        else:
+            # heuristic: looks like a phone if digits > 6
+            if len(re.sub(r'\D','',val)) >= 7:
+                phones.append(val)
+            elif '@' in val:
+                emails.append(val.replace('mailto:', ''))
+            else:
+                phones.append(val)
 
     return {
         "Reporter Qualification": clean_value(qualification),
-        "Reporter Country": get_text(country_elem),
-        "Reporter City/Town": get_text(city_elem),
+        "Reporter IDs": "; ".join(dict.fromkeys([p for p in ids_text.split('; ') if p])) if ids_text else "",
+        "Reporter Name (Full)": clean_value(name_full),
+        "Reporter Given Name(s)": "; ".join(given_names) if given_names else "",
+        "Reporter Family Name": clean_value(family_name),
+        "Reporter Organization": clean_value(org_name),
+        "Reporter Street": clean_value(street),
+        "Reporter City/Town": clean_value(city),
+        "Reporter State/Province": clean_value(state),
+        "Reporter Postal Code": clean_value(postal),
+        "Reporter Country": clean_value(country),
+        "Reporter Phone(s)": "; ".join(dict.fromkeys(phones)) if phones else "",
+        "Reporter Email(s)": "; ".join(dict.fromkeys(emails)) if emails else "",
+        "Reporter Fax(es)": "; ".join(dict.fromkeys(faxes)) if faxes else "",
     }
 
 def extract_narrative(root: ET.Element) -> str:
@@ -370,9 +489,9 @@ def extract_model(xml_bytes: bytes) -> Dict[str, Any]:
     model["Sender ID"] = extract_sender_id(root)
     model["WWID"] = extract_wwid(root)
     model["First Sender Type"] = extract_first_sender_type(root)
-    model.update(extract_td_frd_lrd(root))  # TD/FRD/LRD (raw & formatted)
-    # Reporter (new)
-    model["Reporter"] = extract_reporter(root)
+    model.update(extract_td_frd_lrd(root))
+    # Reporter (QC: full)
+    model["Reporter"] = extract_reporter_full(root)
     # Patient / Products / Events / Narrative
     model["Patient"] = extract_patient(root)
     model["Products"] = extract_products(root)
@@ -380,12 +499,11 @@ def extract_model(xml_bytes: bytes) -> Dict[str, Any]:
     model["Narrative"] = extract_narrative(root)
     return model
 
-# --------------- Helpers to build comparison tables (ONLY non-blank rows) ----------------
+# --------------- Table builders (hide fully blank rows) ----------------
 def compare_table(rows: List[Tuple[str, str, str]], treat_as_dates: bool = False) -> pd.DataFrame:
     disp = []
     for field, s, p in rows:
-        s_str = (s or "").strip()
-        p_str = (p or "").strip()
+        s_str, p_str = (s or "").strip(), (p or "").strip()
         if not s_str and not p_str:
             continue
         marker = mismatch_marker(s, p, is_date=treat_as_dates)
@@ -400,19 +518,32 @@ def make_admin_table(src: Dict[str,Any], prc: Dict[str,Any]) -> pd.DataFrame:
     src_td_disp = src.get("TD", "") or format_date(src.get("TD_raw", ""))
     prc_lrd_disp = prc.get("LRD", "") or format_date(prc.get("LRD_raw", ""))
     rows.append(("Day Zero", src_td_disp, prc_lrd_disp))
-
-    # dates treated as dates only for Day Zero
     parts = [
         compare_table([rows[0]], treat_as_dates=False),
         compare_table([rows[1]], treat_as_dates=False),
         compare_table([rows[2]], treat_as_dates=False),
-        compare_table([rows[3]], treat_as_dates=True)
+        compare_table([rows[3]], treat_as_dates=True),
     ]
-    parts = [df for df in parts if df is not None and not df.empty]
+    parts = [df for df in parts if not df.empty]
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["Field","Source","Processed"])
 
 def make_reporter_table(src: Dict[str,str], prc: Dict[str,str]) -> pd.DataFrame:
-    fields = ["Reporter Qualification", "Reporter Country", "Reporter City/Town"]
+    fields = [
+        "Reporter Qualification",
+        "Reporter IDs",
+        "Reporter Name (Full)",
+        "Reporter Given Name(s)",
+        "Reporter Family Name",
+        "Reporter Organization",
+        "Reporter Street",
+        "Reporter City/Town",
+        "Reporter State/Province",
+        "Reporter Postal Code",
+        "Reporter Country",
+        "Reporter Phone(s)",
+        "Reporter Email(s)",
+        "Reporter Fax(es)",
+    ]
     rows = [(f, src.get(f,""), prc.get(f,"")) for f in fields]
     return compare_table(rows, treat_as_dates=False)
 
@@ -500,26 +631,17 @@ if src.get("_error") or prc.get("_error"):
 # ---------------- SECTION: Admin/Header ----------------
 st.subheader("Admin / Header")
 admin_df = make_admin_table(src, prc)
-if admin_df.empty:
-    st.markdown('<div class="box smallnote">No header/admin values present in either file.</div>', unsafe_allow_html=True)
-else:
-    st.table(admin_df)
+st.table(admin_df) if not admin_df.empty else st.markdown('<div class="box smallnote">No header/admin values present in either file.</div>', unsafe_allow_html=True)
 
-# ---------------- SECTION: Reporter (NEW) ----------------
+# ---------------- SECTION: Reporter (QC – full details) ----------------
 st.subheader("Reporter")
 rep_df = make_reporter_table(src.get("Reporter",{}), prc.get("Reporter",{}))
-if rep_df.empty:
-    st.markdown('<div class="box smallnote">No reporter details present in either file.</div>', unsafe_allow_html=True)
-else:
-    st.table(rep_df)
+st.table(rep_df) if not rep_df.empty else st.markdown('<div class="box smallnote">No reporter details present in either file.</div>', unsafe_allow_html=True)
 
 # ---------------- SECTION: Patient Details ----------------
 st.subheader("Patient Details")
 pat_df = make_patient_table(src.get("Patient",{}), prc.get("Patient",{}))
-if pat_df.empty:
-    st.markdown('<div class="box smallnote">No patient values present in either file.</div>', unsafe_allow_html=True)
-else:
-    st.table(pat_df)
+st.table(pat_df) if not pat_df.empty else st.markdown('<div class="box smallnote">No patient values present in either file.</div>', unsafe_allow_html=True)
 
 # ---------------- SECTION: Drug Details (matched by drug name) ----------------
 st.subheader("Drug Details (suspects) — matched by drug name")
@@ -528,7 +650,6 @@ prc_prods = prc.get("Products", [])
 src_idx = dict_by_key(src_prods)
 prc_idx = dict_by_key(prc_prods)
 all_keys = sorted(set(src_idx) | set(prc_idx))
-
 if not all_keys:
     st.markdown('<div class="box smallnote">No suspect products found in either file.</div>', unsafe_allow_html=True)
 else:
@@ -547,7 +668,6 @@ def idx_events(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
 src_evt_idx = idx_events(src_evts)
 prc_evt_idx = idx_events(prc_evts)
 all_evt_keys = sorted(set(src_evt_idx) | set(prc_evt_idx))
-
 if not all_evt_keys:
     st.markdown('<div class="box smallnote">No events found in either file.</div>', unsafe_allow_html=True)
 else:
@@ -557,7 +677,7 @@ else:
         title = se.get("LLT Term") or pe.get("LLT Term") or (se.get("LLT Code") or pe.get("LLT Code") or "(Unnamed event)")
         make_event_box(se, pe, title)
 
-# ---------------- SECTION: Narrative (optional) ----------------
+# ---------------- SECTION: Narrative ----------------
 st.subheader("Narrative")
 show_full = st.checkbox("Show full narrative (may be long)", value=True)
 max_len = None if show_full else 1000
@@ -565,30 +685,20 @@ src_narr_full = src.get("Narrative","")
 prc_narr_full = prc.get("Narrative","")
 src_narr = src_narr_full[:max_len] if max_len else src_narr_full
 prc_narr = prc_narr_full[:max_len] if max_len else prc_narr_full
-
 if not has_value(src_narr_full) and not has_value(prc_narr_full):
     st.markdown('<div class="box smallnote">No narrative present in either file.</div>', unsafe_allow_html=True)
 else:
-    st.markdown('<div class="box"><h5>Source</h5>', unsafe_allow_html=True)
-    st.code(src_narr or "—")
-    st.markdown('</div>', unsafe_allow_html=True)
-
+    st.markdown('<div class="box"><h5>Source</h5>', unsafe_allow_html=True); st.code(src_narr or "—"); st.markdown('</div>', unsafe_allow_html=True)
     st.markdown('<div class="box"><h5>Processed</h5>', unsafe_allow_html=True)
-    suffix = " 🔴" if (src_narr_full != prc_narr_full) else ""
-    st.code((prc_narr or "—") + suffix)
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.code((prc_narr or "—") + (" 🔴" if (src_narr_full != prc_narr_full) else "")); st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------------- Export (robust Excel engine handling) ----------------
 st.markdown("---")
 st.markdown("### ⬇️ Download Comparison (Excel)")
 
 def rows_from_table(df: pd.DataFrame, section: str) -> List[Dict[str,str]]:
-    out = []
-    if df is None or df.empty:
-        return out
-    for _, r in df.iterrows():
-        out.append({"Section": section, "Field": r["Field"], "Source": r["Source"], "Processed": r["Processed"]})
-    return out
+    if df is None or df.empty: return []
+    return [{"Section": section, "Field": r["Field"], "Source": r["Source"], "Processed": r["Processed"]} for _, r in df.iterrows()]
 
 admin_rows = rows_from_table(admin_df, "Admin/Header")
 reporter_rows = rows_from_table(rep_df, "Reporter")
@@ -621,10 +731,8 @@ for key in all_evt_keys:
 def build_excel_bytes() -> Optional[bytes]:
     sheets: Dict[str, pd.DataFrame] = {}
     sheets["Admin_Reporter_Patient"] = pd.DataFrame(admin_rows + reporter_rows + pat_rows)
-    if prod_rows:
-        sheets["Drugs"] = pd.DataFrame(prod_rows)
-    if evt_rows:
-        sheets["Events"] = pd.DataFrame(evt_rows)
+    if prod_rows: sheets["Drugs"] = pd.DataFrame(prod_rows)
+    if evt_rows: sheets["Events"] = pd.DataFrame(evt_rows)
     if has_value(src.get("Narrative","")) or has_value(prc.get("Narrative","")):
         sheets["Narrative"] = pd.DataFrame([{
             "Source Narrative": src.get("Narrative","") or "—",
@@ -632,7 +740,6 @@ def build_excel_bytes() -> Optional[bytes]:
         }])
 
     excel_buffer = io.BytesIO()
-    # Try openpyxl, then xlsxwriter
     for engine in ("openpyxl", "xlsxwriter"):
         try:
             with pd.ExcelWriter(excel_buffer, engine=engine) as writer:
