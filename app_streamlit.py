@@ -10,6 +10,9 @@ from typing import Optional, Dict, Any, List, Tuple, Set
 st.set_page_config(page_title="E2B_R3 Two-File Comparator (Tabular, Box-wise)", layout="wide")
 st.title("🧪📄📄 E2B_R3 Two‑File Comparator — Tabular, Box‑wise")
 
+# Optional debug controls (Events parsing warnings)
+DEBUG_EVENTS = st.sidebar.checkbox("Debug events parsing", value=False)
+
 # ---------------- Utilities ----------------
 NS = {'hl7': 'urn:hl7-org:v3', 'xsi': 'http://www.w3.org/2001/XMLSchema-instance'}
 UNKNOWN_TOKENS = {"unk", "asku", "unknown"}
@@ -20,7 +23,7 @@ WWID_OID           = "2.16.840.1.113883.3.989.2.1.3.2"   # WWID
 FIRST_SENDER_OID   = "2.16.840.1.113883.3.989.2.1.1.3"   # First sender of case (1=Regulator, 2=Other)
 FIRST_SENDER_MAP   = {"1": "Regulator", "2": "Other"}
 
-# Reporter qualification mapping (as in your triage app)
+# Reporter qualification mapping (as in triage)
 REPORTER_MAP = {
     "1": "Physician",
     "2": "Pharmacist",
@@ -29,7 +32,7 @@ REPORTER_MAP = {
     "5": "Consumer or other non-health professional",
 }
 
-# "Report Source" (your snippet)
+# "Report Source" from your snippet
 REPORT_SOURCE_OID = "2.16.840.1.113883.3.989.2.1.1.22"
 
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
@@ -134,7 +137,7 @@ def has_value(x: str) -> bool:
 def safe_disp(v: str) -> str:
     return v if v else "—"
 
-# ---------------- Canonical extraction ----------------
+# ---------------- Admin extraction ----------------
 def extract_id_by_oid(root: ET.Element, oid: str) -> str:
     e = find_first(root, f'.//hl7:id[@root="{oid}"]')
     return clean_value(e.attrib.get('extension', '')) if e is not None else ""
@@ -186,6 +189,7 @@ def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
             out["FRD_raw"] = pairs[0][1]; out["FRD"] = format_date(pairs[0][1])
     return out
 
+# ---------------- Patient extraction ----------------
 def extract_patient(root: ET.Element) -> Dict[str, str]:
     gender_elem = find_first(root, './/hl7:administrativeGenderCode')
     gender_code = gender_elem.attrib.get('code', '') if gender_elem is not None else ''
@@ -237,6 +241,7 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
         "Height": clean_value(height), "Weight": clean_value(weight), "Initials": clean_value(initials),
     }
 
+# ---------------- Products extraction ----------------
 def extract_suspect_ids(root: ET.Element) -> Set[str]:
     out = set()
     for c in findall(root, './/hl7:causalityAssessment'):
@@ -300,14 +305,14 @@ def extract_products(root: ET.Element) -> List[Dict[str, str]]:
             })
     return products
 
-# -------- Reporter extraction (QC: robust + mask-aware) --------
-
+# ---------------- Reporter extraction (robust + mask-aware) ----------------
 def reporter_candidates(root: ET.Element) -> List[ET.Element]:
     """
     Likely reporter containers (avoid bare asQualifiedEntity).
+    Prefers author/assignedEntity (your snippet), but supports others.
     """
     cands: List[ET.Element] = []
-    # Primary: author/assignedEntity (your snippet)
+    # Primary: author/assignedEntity
     cands += list(root.findall('.//hl7:author/hl7:assignedEntity', NS))
     # Also consider assignedAuthor and informant/assignedEntity
     cands += list(root.findall('.//hl7:author/hl7:assignedAuthor', NS))
@@ -329,6 +334,7 @@ def reporter_candidates(root: ET.Element) -> List[ET.Element]:
 
 def extract_reporter_full(root: ET.Element) -> Dict[str, str]:
     result = {
+        "Report Source": "",
         "Reporter Qualification": "",
         "Reporter IDs": "",
         "Reporter Name (Full)": "",
@@ -343,17 +349,14 @@ def extract_reporter_full(root: ET.Element) -> Dict[str, str]:
         "Reporter Phone(s)": "",
         "Reporter Email(s)": "",
         "Reporter Fax(es)": "",
-        "Report Source": "",  # from codeSystem …1.1.22 if present
     }
 
     cands = reporter_candidates(root)
-    # Pull report source from anywhere
     result["Report Source"] = extract_report_source(root)
 
     if not cands:
         return result
 
-    # Helper collectors bound to a container node
     def collect_ids(node: ET.Element) -> List[str]:
         ids = []
         for id_el in node.findall('.//hl7:id', NS):
@@ -365,7 +368,6 @@ def extract_reporter_full(root: ET.Element) -> Dict[str, str]:
         return list(dict.fromkeys(ids))
 
     def collect_qualification(node: ET.Element) -> str:
-        # Map any code 1..5 under the container
         for code_el in node.iter():
             if local_name(code_el.tag) == 'code':
                 c = (code_el.attrib.get('code') or '').strip()
@@ -380,7 +382,6 @@ def extract_reporter_full(root: ET.Element) -> Dict[str, str]:
             name_el = node.find('.//hl7:name', NS)
         given, family = [], ""
         if name_el is not None:
-            # Mask-aware children
             for g in name_el.findall('hl7:given', NS):
                 val = read_text_or_mask(g)
                 if val: given.append(val)
@@ -388,9 +389,7 @@ def extract_reporter_full(root: ET.Element) -> Dict[str, str]:
             family = read_text_or_mask(fam_el)
         parts = [p for p in given if p] + ([family] if family else [])
         full = " ".join(parts).strip()
-        # If entirely masked children and no text, still keep "Masked"
         if not full and name_el is not None:
-            # Presence of any MSK child -> 'Masked'
             msks = any((ch.attrib.get('nullFlavor','') == 'MSK') for ch in name_el)
             full = "Masked" if msks else full
         return full, given, family
@@ -420,7 +419,7 @@ def extract_reporter_full(root: ET.Element) -> Dict[str, str]:
             state  = read_text_or_mask(addr.find('hl7:state', NS))
             postal = read_text_or_mask(addr.find('hl7:postalCode', NS))
             country= read_text_or_mask(addr.find('hl7:country', NS))
-        # Country fallback via asLocatedEntity/location/code@code (your snippet)
+        # Fallback via asLocatedEntity/location/code@code (your snippet)
         if not country:
             loc = node.find('.//hl7:asLocatedEntity/hl7:location/hl7:code', NS)
             if loc is not None and loc.attrib.get('code'):
@@ -450,7 +449,6 @@ def extract_reporter_full(root: ET.Element) -> Dict[str, str]:
         uniq = lambda L: list(dict.fromkeys([x for x in L if x]))
         return uniq(phones), uniq(emails), uniq(faxes)
 
-    # Use the first container that yields any data
     for node in cands:
         ids = collect_ids(node)
         qual = collect_qualification(node)
@@ -480,11 +478,110 @@ def extract_reporter_full(root: ET.Element) -> Dict[str, str]:
 
     return result
 
+# ---------------- Events extraction (robust + debug) ----------------
+def extract_events(root: ET.Element, debug: bool = False) -> List[Dict[str, Any]]:
+    """
+    Robust event extractor:
+      - Never raises; returns [] on failure.
+      - Per-event try/except so one bad node doesn't kill the whole case.
+      - Extra null-safety around attribute access.
+      - Optional debug rows if debug=True.
+    """
+    out: List[Dict[str, Any]] = []
+    debug_rows: List[str] = []
+
+    try:
+        rxns = findall(root, './/hl7:observation')
+        if not rxns:
+            rxns = [el for el in root.iter() if local_name(el.tag) == 'observation']
+
+        for idx, rxn in enumerate(rxns, start=1):
+            try:
+                code_el = rxn.find('hl7:code', NS)
+                is_reaction = False
+                if code_el is not None:
+                    disp = (code_el.attrib.get('displayName') or '').strip()
+                    is_reaction = (disp.lower() == 'reaction')
+
+                val_el = rxn.find('hl7:value', NS)
+                if not is_reaction and val_el is None:
+                    continue
+
+                llt_code = (val_el.attrib.get('code') or '').strip() if val_el is not None else ''
+                llt_term = (val_el.attrib.get('displayName') or '').strip() if val_el is not None else ''
+                if not (llt_code or llt_term):
+                    if val_el is not None:
+                        ot = val_el.find('hl7:originalText', NS)
+                        llt_term = get_text(ot)
+                    if not (llt_code or llt_term):
+                        continue
+
+                ser_map = {
+                    "resultsInDeath": "Death",
+                    "isLifeThreatening": "LT",
+                    "requiresInpatientHospitalization": "Hospital",
+                    "resultsInPersistentOrSignificantDisability": "Disability",
+                    "congenitalAnomalyBirthDefect": "Congenital",
+                    "otherMedicallyImportantCondition": "IME"
+                }
+                flags: List[str] = []
+                for k, lbl in ser_map.items():
+                    crit = rxn.find(f'.//hl7:code[@displayName="{k}"]/../hl7:value', NS)
+                    if crit is not None and (crit.attrib.get('value') or '').strip().lower() == 'true':
+                        flags.append(lbl)
+
+                outcome_map = {
+                    "1": "Recovered/Resolved",
+                    "2": "Recovering/Resolving",
+                    "3": "Not recovered/Ongoing",
+                    "4": "Recovered with sequelae",
+                    "5": "Fatal",
+                    "0": "Unknown"
+                }
+                outcome_el = rxn.find('.//hl7:code[@displayName="outcome"]/../hl7:value', NS)
+                outcome_code = (outcome_el.attrib.get('code') or '').strip() if outcome_el is not None else ''
+                outcome = outcome_map.get(outcome_code, "Unknown" if outcome_code else "")
+
+                low = rxn.find('.//hl7:effectiveTime/hl7:low', NS)
+                high = rxn.find('.//hl7:effectiveTime/hl7:high', NS)
+                start_raw = (low.attrib.get('value') or '').strip() if low is not None else ''
+                end_raw = (high.attrib.get('value') or '').strip() if high is not None else ''
+                start_disp = format_date(start_raw)
+                end_disp = format_date(end_raw)
+
+                out.append({
+                    "LLT Code": clean_value(llt_code),
+                    "LLT Term": clean_value(llt_term),
+                    "Seriousness": "Non-serious" if not flags else ", ".join(sorted(set(flags))),
+                    "Outcome": clean_value(outcome),
+                    "Event Start (raw)": start_raw,
+                    "Event Start": start_disp,
+                    "Event End (raw)": end_raw,
+                    "Event End": end_disp,
+                    "_key": clean_value(llt_code) or normalize_text(llt_term),
+                })
+
+            except Exception as e_evt:
+                if debug:
+                    debug_rows.append(f"[event {idx}] {type(e_evt).__name__}: {e_evt}")
+
+        if debug and debug_rows:
+            st.warning("Event parsing warnings:\n- " + "\n- ".join(debug_rows))
+
+        return out
+
+    except Exception as e:
+        if debug:
+            st.exception(e)
+        return out
+
+# ---------------- Narrative extraction ----------------
 def extract_narrative(root: ET.Element) -> str:
     narrative_elem = root.find('.//hl7:code[@code="PAT_ADV_EVNT"]/../hl7:text', NS)
     return clean_value(narrative_elem.text if narrative_elem is not None else '')
 
-def extract_model(xml_bytes: bytes) -> Dict[str, Any]:
+# ---------------- Model builder ----------------
+def extract_model(xml_bytes: bytes, debug_events: bool = False) -> Dict[str, Any]:
     try:
         root = ET.fromstring(xml_bytes)
     except Exception as e:
@@ -495,12 +592,12 @@ def extract_model(xml_bytes: bytes) -> Dict[str, Any]:
     model["WWID"] = extract_wwid(root)
     model["First Sender Type"] = extract_first_sender_type(root)
     model.update(extract_td_frd_lrd(root))
-    # Reporter (QC: robust)
+    # Reporter (robust)
     model["Reporter"] = extract_reporter_full(root)
     # Patient / Products / Events / Narrative
     model["Patient"] = extract_patient(root)
     model["Products"] = extract_products(root)
-    model["Events"] = extract_events(root)
+    model["Events"] = extract_events(root, debug=debug_events)
     model["Narrative"] = extract_narrative(root)
     return model
 
@@ -534,7 +631,7 @@ def make_admin_table(src: Dict[str,Any], prc: Dict[str,Any]) -> pd.DataFrame:
 
 def make_reporter_table(src: Dict[str,str], prc: Dict[str,str]) -> pd.DataFrame:
     fields = [
-        "Report Source",               # NEW
+        "Report Source",
         "Reporter Qualification",
         "Reporter IDs",
         "Reporter Name (Full)",
@@ -629,9 +726,9 @@ src_bytes = src_file.read()
 prc_bytes = prc_file.read()
 
 with st.spinner("Parsing Source..."):
-    src = extract_model(src_bytes)
+    src = extract_model(src_bytes, debug_events=DEBUG_EVENTS)
 with st.spinner("Parsing Processed..."):
-    prc = extract_model(prc_bytes)
+    prc = extract_model(prc_bytes, debug_events=DEBUG_EVENTS)
 
 if src.get("_error") or prc.get("_error"):
     st.error(f"Source error: {src.get('_error','-')}\nProcessed error: {prc.get('_error','-')}")
@@ -645,7 +742,7 @@ if not admin_df.empty:
 else:
     st.markdown('<div class="box smallnote">No header/admin values present in either file.</div>', unsafe_allow_html=True)
 
-# ---------------- SECTION: Reporter (QC – full details) ----------------
+# ---------------- SECTION: Reporter ----------------
 st.subheader("Reporter")
 rep_df = make_reporter_table(src.get("Reporter",{}), prc.get("Reporter",{}))
 if not rep_df.empty:
