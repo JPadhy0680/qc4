@@ -33,6 +33,9 @@ REPORTER_MAP = {
     "5": "Consumer or other non-health professional",
 }
 
+# Reporter SOURCE anchor OID
+REPORT_SOURCE_OID  = "2.16.840.1.113883.3.989.2.1.1.22"  # displayName="sourceReport"
+
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
 TD_PATHS = [
     './/hl7:transmissionWrapper/hl7:creationTime',
@@ -154,6 +157,7 @@ def extract_first_sender_type(root: ET.Element) -> str:
 
 def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
     out = {"TD_raw":"", "TD":"", "FRD_raw":"", "FRD":"", "LRD_raw":"", "LRD":""}
+    # TD
     for p in TD_PATHS:
         e = find_first(root, p)
         if e is not None:
@@ -161,12 +165,13 @@ def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
             if val:
                 out["TD_raw"] = val; out["TD"] = format_date(val)
                 break
+    # LRD
     for el in root.iter():
         if local_name(el.tag) == 'availabilityTime':
             v = el.attrib.get('value')
             if v:
                 out["LRD_raw"] = v; out["LRD"] = format_date(v); break
-    # FRD: earliest <low>
+    # FRD (earliest low)
     lows = []
     for el in root.iter():
         if local_name(el.tag) == 'low':
@@ -295,49 +300,56 @@ def extract_products(root: ET.Element) -> List[Dict[str, str]]:
             })
     return products
 
-# ---------------- Reporters: collect ALL reporters ----------------
-def reporter_containers_all(root: ET.Element) -> List[ET.Element]:
+# ---------------- Reporter extraction (STRICT: only branches marked by sourceReport) ----------------
+def build_parent_map(root: ET.Element) -> Dict[ET.Element, ET.Element]:
+    return {c: p for p in root.iter() for c in list(p)}
+
+def find_all_source_report_containers(root: ET.Element) -> List[ET.Element]:
     """
-    Collect all plausible reporter containers across the document:
-      - author/assignedEntity
-      - author/assignedAuthor
-      - informant/assignedEntity
-      - any assignedEntity/assignedAuthor under common header branches
-      - participant[@typeCode in {AUT, INF}] descendants that have assignedEntity/assignedAuthor
+    Find ALL reporter containers that belong to branches containing:
+      <code codeSystem=REPORT_SOURCE_OID displayName='sourceReport'/>
+    We anchor on the <code>, walk up to a logical ancestor (relatedInvestigation / subjectOf2 / controlActEvent),
+    then search down for reporter containers (author/assignedEntity|assignedAuthor, informant/assignedEntity).
     """
-    cands: List[ET.Element] = []
-    # primary locations
-    cands += list(root.findall('.//hl7:author/hl7:assignedEntity', NS))
-    cands += list(root.findall('.//hl7:author/hl7:assignedAuthor', NS))
-    cands += list(root.findall('.//hl7:informant/hl7:assignedEntity', NS))
-    # generic fallbacks (may include non-reporter assignedEntity; we’ll filter on content)
-    cands += list(root.findall('.//hl7:assignedEntity', NS))
-    cands += list(root.findall('.//hl7:assignedAuthor', NS))
-    # participant typed
-    for p in root.findall('.//hl7:participant', NS):
-        if (p.attrib.get('typeCode') or '').upper() in {'AUT','INF'}:
-            for xp in ['.//hl7:assignedEntity', './/hl7:assignedAuthor']:
-                cand = p.find(xp, NS)
-                if cand is not None:
-                    cands.append(cand)
-    # de-dup (by element identity)
+    # 1) all <code> nodes that are sourceReport
+    code_nodes: List[ET.Element] = []
+    for el in root.iter():
+        if local_name(el.tag) == 'code' and el.attrib.get('codeSystem') == REPORT_SOURCE_OID:
+            if (el.attrib.get('displayName') or '').strip().lower() == 'sourcereport':
+                code_nodes.append(el)
+    if not code_nodes:
+        return []
+
+    parent = build_parent_map(root)
+
+    def ancestors(node: ET.Element) -> List[ET.Element]:
+        acc = []
+        cur = node
+        while cur in parent:
+            cur = parent[cur]
+            acc.append(cur)
+        return acc
+
+    containers: List[ET.Element] = []
+    for code_el in code_nodes:
+        for anc in ancestors(code_el):
+            lname = local_name(anc.tag)
+            if lname in {'relatedInvestigation', 'subjectOf2', 'controlActEvent'}:
+                for xp in [
+                    './/hl7:author/hl7:assignedEntity',
+                    './/hl7:author/hl7:assignedAuthor',
+                    './/hl7:informant/hl7:assignedEntity',
+                ]:
+                    cand = anc.find(xp, NS)
+                    if cand is not None:
+                        containers.append(cand)
+                break  # stop at the first logical ancestor
+    # de-dup by element identity
     seen, uniq = set(), []
-    for el in cands:
+    for el in containers:
         if id(el) not in seen:
             seen.add(id(el)); uniq.append(el)
-    # light content filter: keep nodes that have name/addr/telecom/qualification
-    filtered = []
-    for n in uniq:
-        has_signal = any([
-            n.find('.//hl7:assignedPerson/hl7:name', NS) is not None,
-            n.find('.//hl7:name', NS) is not None,
-            n.find('.//hl7:addr', NS) is not None,
-            n.find('.//hl7:telecom', NS) is not None,
-            n.find('.//hl7:asQualifiedEntity/hl7:code', NS) is not None,
-        ])
-        if has_signal:
-            filtered.append(n)
-    return filtered
+    return uniq
 
 def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
     """
@@ -371,7 +383,7 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
     if ids:
         result["Reporter IDs"] = "; ".join(dict.fromkeys(ids))
 
-    # Qualification (1..5)
+    # Qualification (1..5) under codeSystem 1.1.6
     qual = ""
     for code_el in node.iter():
         if local_name(code_el.tag) == 'code' and code_el.attrib.get('codeSystem') == REPORTER_QUAL_OID:
@@ -461,7 +473,7 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
 def make_reporter_key(rep: Dict[str, str]) -> str:
     """
     Stable key to match source vs processed reporters:
-     - Prefer Reporter IDs; else composite of Name(Clean) + Qualification + Country + Organization.
+     - Prefer Reporter IDs; else composite of Name + Qualification + Country + Organization.
     """
     ids = (rep.get("Reporter IDs") or "").lower().strip()
     if ids:
@@ -474,13 +486,15 @@ def make_reporter_key(rep: Dict[str, str]) -> str:
     ]).lower()
     return normalize_text(composite) or "unknown"
 
-def extract_reporters(root: ET.Element) -> List[Dict[str, str]]:
-    containers = reporter_containers_all(root)
+def extract_reporters_from_sourceReport(root: ET.Element) -> List[Dict[str, str]]:
+    """
+    Return ALL reporters that sit under branches marked with sourceReport.
+    """
+    containers = find_all_source_report_containers(root)
     reporters: List[Dict[str, str]] = []
     for node in containers:
         rep = extract_reporter_from_container(node)
-        # Keep only if at least one value exists
-        if any(clean_value(v) for v in rep.values()):
+        if any(clean_value(v) for v in rep.values()):  # keep non-empty
             rep["_key"] = make_reporter_key(rep)
             reporters.append(rep)
     return reporters
@@ -575,8 +589,8 @@ def extract_model(xml_bytes: bytes, debug_events: bool = False) -> Dict[str, Any
     model["WWID"] = extract_wwid(root)
     model["First Sender Type"] = extract_first_sender_type(root)
     model.update(extract_td_frd_lrd(root))
-    # Reporters (ALL)
-    model["Reporters"] = extract_reporters(root)
+    # Reporters (ONLY those under branches with sourceReport marker; ALL of them)
+    model["Reporters"] = extract_reporters_from_sourceReport(root)
     # Patient / Products / Events / Narrative
     model["Patient"] = extract_patient(root)
     model["Products"] = extract_products(root)
@@ -632,6 +646,11 @@ def make_reporter_table_one(src: Dict[str,str], prc: Dict[str,str]) -> pd.DataFr
     rows = [(f, src.get(f,""), prc.get(f,"")) for f in fields]
     return compare_table(rows, treat_as_dates=False)
 
+def make_patient_table(src_pat: Dict[str,str], prc_pat: Dict[str,str]) -> pd.DataFrame:
+    fields = ["Gender","Age","Age Group","Height","Weight","Initials"]
+    rows = [(f, src_pat.get(f,""), prc_pat.get(f,"")) for f in fields]
+    return compare_table(rows, treat_as_dates=False)
+
 def dict_by_key(items: List[Dict[str,Any]]) -> Dict[str, Dict[str,Any]]:
     return {it.get("_key",""): it for it in items if it.get("_key","")}
 
@@ -667,15 +686,15 @@ if not admin_df.empty:
 else:
     st.markdown('<div class="box smallnote">No header/admin values present in either file.</div>', unsafe_allow_html=True)
 
-# ---------------- SECTION: Reporters (ALL, matched by key) ----------------
-st.subheader("Reporters")
+# ---------------- SECTION: Reporters (ONLY from sourceReport branches; ALL of them) ----------------
+st.subheader("Reporters (from sourceReport branches)")
 src_reps = src.get("Reporters", []) or []
 prc_reps = prc.get("Reporters", []) or []
 src_rep_idx = dict_by_key(src_reps)
 prc_rep_idx = dict_by_key(prc_reps)
 
 # ensure keys unique even if duplicates (e.g., all Masked)
-def uniquify_keys(idx: Dict[str,Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
+def _uniquify_keys(idx: Dict[str,Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
     out = {}
     seen = {}
     for k, v in idx.items():
@@ -686,12 +705,12 @@ def uniquify_keys(idx: Dict[str,Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
         out[key] = v
     return out
 
-src_rep_idx = uniquify_keys(src_rep_idx)
-prc_rep_idx = uniquify_keys(prc_rep_idx)
+src_rep_idx = _uniquify_keys(src_rep_idx)
+prc_rep_idx = _uniquify_keys(prc_rep_idx)
 
 all_rep_keys = sorted(set(src_rep_idx) | set(prc_rep_idx))
 if not all_rep_keys:
-    st.markdown('<div class="box smallnote">No reporters present in either file.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="box smallnote">No reporters (sourceReport) present in either file.</div>', unsafe_allow_html=True)
 else:
     for i, key in enumerate(all_rep_keys, start=1):
         srec = src_rep_idx.get(key, {})
@@ -699,11 +718,11 @@ else:
         title = srec.get("Reporter Name (Full)") or prec.get("Reporter Name (Full)") or \
                 srec.get("Reporter Organization") or prec.get("Reporter Organization") or f"Reporter {i}"
         st.markdown(f'<div class="box"><h5>{title}</h5>', unsafe_allow_html=True)
-        df = make_reporter_table_one(srec, prec)
-        if df.empty:
+        r_df = make_reporter_table_one(srec, prec)
+        if r_df.empty:
             st.markdown('<div class="smallnote">No values to display for this reporter in either file.</div>', unsafe_allow_html=True)
         else:
-            st.table(df)
+            st.table(r_df)
         st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------------- SECTION: Patient Details ----------------
@@ -720,8 +739,9 @@ src_prods = src.get("Products", [])
 prc_prods = prc.get("Products", [])
 src_idx = dict_by_key(src_prods)
 prc_idx = dict_by_key(prc_prods)
-all_keys = sorted(set(src_idx) | set(prc_idx))
-def make_product_box(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
+all_drug_keys = sorted(set(src_idx) | set(prc_idx))
+
+def make_product_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
     st.markdown(f'<div class="box"><h5>Drug: {title}</h5>', unsafe_allow_html=True)
     fields = [
         ("Dosage Text","text"),
@@ -741,32 +761,33 @@ def make_product_box(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str)
             s_val = s_val or format_date(src_rec.get(field + " (raw)",""))
             p_val = p_val or format_date(prc_rec.get(field + " (raw)",""))
         rows.append((field, s_val, p_val))
-    df = compare_table(rows, treat_as_dates=True)
-    if df.empty:
+    d_df = compare_table(rows, treat_as_dates=True)
+    if d_df.empty:
         st.markdown('<div class="smallnote">No values to display for this drug in either file.</div>', unsafe_allow_html=True)
     else:
-        st.table(df)
+        st.table(d_df)
     st.markdown('</div>', unsafe_allow_html=True)
 
-if not all_keys:
+if not all_drug_keys:
     st.markdown('<div class="box smallnote">No suspect products found in either file.</div>', unsafe_allow_html=True)
 else:
-    for key in all_keys:
+    for key in all_drug_keys:
         srec = src_idx.get(key, {"Drug": ""})
         prec = prc_idx.get(key, {"Drug": ""})
         title = srec.get("Drug") or prec.get("Drug") or "(Unnamed drug)"
-        make_product_box(srec, prec, title)
+        make_product_box_for_ui(srec, prec, title)
 
 # ---------------- SECTION: Event Details (matched by LLT Code then term) ----------------
 st.subheader("Event Details — matched by LLT code (fallback: normalized term)")
 src_evts = src.get("Events", [])
 prc_evts = prc.get("Events", [])
-def idx_events(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
+def _idx_events(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
     return {e.get("_key",""): e for e in lst if e.get("_key","")}
-src_evt_idx = idx_events(src_evts)
-prc_evt_idx = idx_events(prc_evts)
+src_evt_idx = _idx_events(src_evts)
+prc_evt_idx = _idx_events(prc_evts)
 all_evt_keys = sorted(set(src_evt_idx) | set(prc_evt_idx))
-def make_event_box(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
+
+def make_event_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
     st.markdown(f'<div class="box"><h5>Event: {title}</h5>', unsafe_allow_html=True)
     fields = [
         ("LLT Code","text"),
@@ -784,11 +805,11 @@ def make_event_box(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
             s_val = s_val or format_date(src_rec.get(field + " (raw)",""))
             p_val = p_val or format_date(prc_rec.get(field + " (raw)",""))
         rows.append((field, s_val, p_val))
-    df = compare_table(rows, treat_as_dates=True)
-    if df.empty:
+    e_df = compare_table(rows, treat_as_dates=True)
+    if e_df.empty:
         st.markdown('<div class="smallnote">No values to display for this event in either file.</div>', unsafe_allow_html=True)
     else:
-        st.table(df)
+        st.table(e_df)
     st.markdown('</div>', unsafe_allow_html=True)
 
 if not all_evt_keys:
@@ -798,7 +819,7 @@ else:
         se = src_evt_idx.get(key, {"LLT Term": ""})
         pe = prc_evt_idx.get(key, {"LLT Term": ""})
         title = se.get("LLT Term") or pe.get("LLT Term") or (se.get("LLT Code") or pe.get("LLT Code") or "(Unnamed event)")
-        make_event_box(se, pe, title)
+        make_event_box_for_ui(se, pe, title)
 
 # ---------------- SECTION: Narrative ----------------
 st.subheader("Narrative")
@@ -835,11 +856,11 @@ for i, key in enumerate(all_rep_keys, start=1):
     reporter_rows += rows_from_table(df_r, "Reporter", group=title)
 
 # Patient rows
-pat_rows = rows_from_table(pat_df, "Patient")
+patient_rows = rows_from_table(pat_df, "Patient")
 
 # Drugs sheet
-prod_rows = []
-for key in all_keys:
+drug_rows = []
+for key in all_drug_keys:
     srec = src_idx.get(key, {})
     prec = prc_idx.get(key, {})
     title = srec.get("Drug") or prec.get("Drug") or "(Unnamed drug)"
@@ -847,10 +868,10 @@ for key in all_keys:
         s_val = srec.get(field, "") or (format_date(srec.get(field + " (raw)","")) if "Date" in field else "")
         p_val = prec.get(field, "") or (format_date(prec.get(field + " (raw)","")) if "Date" in field else "")
         if has_value(s_val) or has_value(p_val):
-            prod_rows.append({"Section":"Drug", "Group": title, "Field": field, "Source": s_val or "—", "Processed": p_val or "—"})
+            drug_rows.append({"Section":"Drug", "Group": title, "Field": field, "Source": s_val or "—", "Processed": p_val or "—"})
 
 # Events sheet
-evt_rows = []
+event_rows = []
 for key in all_evt_keys:
     se = src_evt_idx.get(key, {})
     pe = prc_evt_idx.get(key, {})
@@ -859,14 +880,16 @@ for key in all_evt_keys:
         s_val = se.get(field, "") or (format_date(se.get(field + " (raw)","")) if "Event" in field else "")
         p_val = pe.get(field, "") or (format_date(pe.get(field + " (raw)","")) if "Event" in field else "")
         if has_value(s_val) or has_value(p_val):
-            evt_rows.append({"Section":"Event", "Group": title, "Field": field, "Source": s_val or "—", "Processed": p_val or "—"})
+            event_rows.append({"Section":"Event", "Group": title, "Field": field, "Source": s_val or "—", "Processed": p_val or "—"})
 
 def build_excel_bytes() -> Optional[bytes]:
     sheets: Dict[str, pd.DataFrame] = {}
-    sheets["Admin_Patient"] = pd.DataFrame(admin_rows + pat_rows)
+    sheets["Admin_Patient"] = pd.DataFrame(admin_rows + patient_rows)
     if reporter_rows: sheets["Reporters"] = pd.DataFrame(reporter_rows)
-    if prod_rows: sheets["Drugs"] = pd.DataFrame(prod_rows)
-    if evt_rows: sheets["Events"] = pd.DataFrame(evt_rows)
+    if drug_rows:     sheets["Drugs"] = pd.DataFrame(drug_rows)
+    if event_rows:    sheets["Events"] = pd.DataFrame(event_rows)
+    # Narrative, if any
+    # (kept simple — one row with both narratives)
     if has_value(src.get("Narrative","")) or has_value(prc.get("Narrative","")):
         sheets["Narrative"] = pd.DataFrame([{
             "Source Narrative": src.get("Narrative","") or "—",
