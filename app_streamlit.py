@@ -453,7 +453,7 @@ def extract_reporters_from_sourceReport(root: ET.Element) -> List[Dict[str, str]
     for node in containers:
         rep = extract_reporter_from_container(node)
         if any(clean_value(v) for v in rep.values()):
-            reporters.append(rep)  # sequential; no matching here
+            reporters.append(rep)  # sequential; no matching
     return reporters
 
 # ---------------- Events extraction (robust + debug) ----------------
@@ -580,7 +580,7 @@ def make_admin_table(src: Dict[str,Any], prc: Dict[str,Any]) -> pd.DataFrame:
     parts = [df for df in parts if not df.empty]
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["Field","Source","Processed"])
 
-def make_reporter_table_one_side(rep: Dict[str,str]) -> pd.DataFrame:
+def make_reporter_pair_table(src_rep: Dict[str,str], prc_rep: Dict[str,str]) -> pd.DataFrame:
     fields = [
         "Reporter Qualification",
         "Reporter IDs",
@@ -597,21 +597,13 @@ def make_reporter_table_one_side(rep: Dict[str,str]) -> pd.DataFrame:
         "Reporter Email(s)",
         "Reporter Fax(es)",
     ]
-    rows = [(f, rep.get(f,"")) for f in fields]
-    # render as single-column table for one side
-    disp = []
-    for field, val in rows:
-        if has_value(val):
-            disp.append({"Field": field, "Value": val})
-    return pd.DataFrame(disp) if disp else pd.DataFrame(columns=["Field","Value"])
+    rows = [(f, src_rep.get(f,""), prc_rep.get(f,"")) for f in fields]
+    return compare_table(rows, treat_as_dates=False)
 
 def make_patient_table(src_pat: Dict[str,str], prc_pat: Dict[str,str]) -> pd.DataFrame:
     fields = ["Gender","Age","Age Group","Height","Weight","Initials"]
     rows = [(f, src_pat.get(f,""), prc_pat.get(f,"")) for f in fields]
     return compare_table(rows, treat_as_dates=False)
-
-def dict_by_key(items: List[Dict[str,Any]]) -> Dict[str, Dict[str,Any]]:
-    return {str(i): it for i, it in enumerate(items, start=1)}  # index order map
 
 # --------------- UI: Upload & Parse ----------------
 st.markdown("### 📤 Upload the two XML files you want to compare (no ID pairing; exact files compared)")
@@ -645,41 +637,25 @@ if not admin_df.empty:
 else:
     st.markdown('<div class="box smallnote">No header/admin values present in either file.</div>', unsafe_allow_html=True)
 
-# ---------------- SECTION: Reporters (sequential; no matching) ----------------
-st.subheader("Reporters (sequential listing)")
-
+# ---------------- SECTION: Reporters (paired by index; Field | Source | Processed) ----------------
+st.subheader("Reporters (paired sequentially)")
 src_reps = src.get("Reporters", []) or []
 prc_reps = prc.get("Reporters", []) or []
 
-colL, colR = st.columns(2)
-
-with colL:
-    st.markdown("**Source**")
-    if not src_reps:
-        st.markdown('<div class="box smallnote">No reporters found in Source.</div>', unsafe_allow_html=True)
-    else:
-        for i, rep in enumerate(src_reps, start=1):
-            st.markdown(f'<div class="box"><h5>Reporter {i}</h5>', unsafe_allow_html=True)
-            df_side = make_reporter_table_one_side(rep)
-            if df_side.empty:
-                st.markdown('<div class="smallnote">No values present for this reporter.</div>', unsafe_allow_html=True)
-            else:
-                st.table(df_side)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-with colR:
-    st.markdown("**Processed**")
-    if not prc_reps:
-        st.markdown('<div class="box smallnote">No reporters found in Processed.</div>', unsafe_allow_html=True)
-    else:
-        for i, rep in enumerate(prc_reps, start=1):
-            st.markdown(f'<div class="box"><h5>Reporter {i}</h5>', unsafe_allow_html=True)
-            df_side = make_reporter_table_one_side(rep)
-            if df_side.empty:
-                st.markdown('<div class="smallnote">No values present for this reporter.</div>', unsafe_allow_html=True)
-            else:
-                st.table(df_side)
-            st.markdown('</div>', unsafe_allow_html=True)
+n_boxes = max(len(src_reps), len(prc_reps))
+if n_boxes == 0:
+    st.markdown('<div class="box smallnote">No reporters (sourceReport) present in either file.</div>', unsafe_allow_html=True)
+else:
+    for i in range(n_boxes):
+        srep = src_reps[i] if i < len(src_reps) else {}
+        prep = prc_reps[i] if i < len(prc_reps) else {}
+        st.markdown(f'<div class="box"><h5>Reporter {i+1}</h5>', unsafe_allow_html=True)
+        r_df = make_reporter_pair_table(srep, prep)
+        if r_df.empty:
+            st.markdown('<div class="smallnote">No values to display for this reporter in either file.</div>', unsafe_allow_html=True)
+        else:
+            st.table(r_df)
+        st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------------- SECTION: Patient Details ----------------
 st.subheader("Patient Details")
@@ -693,8 +669,10 @@ else:
 st.subheader("Drug Details (suspects) — matched by drug name")
 src_prods = src.get("Products", [])
 prc_prods = prc.get("Products", [])
-src_idx = { (it.get("_key") or f"src#{i}"): it for i, it in enumerate(src_prods, 1) }
-prc_idx = { (it.get("_key") or f"prc#{i}"): it for i, it in enumerate(prc_prods, 1) }
+def dict_by_key(items: List[Dict[str,Any]]) -> Dict[str, Dict[str,Any]]:
+    return {it.get("_key",""): it for it in items if it.get("_key","")}
+src_idx = dict_by_key(src_prods)
+prc_idx = dict_by_key(prc_prods)
 all_drug_keys = sorted(set(src_idx) | set(prc_idx))
 
 def make_product_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
@@ -795,25 +773,21 @@ else:
 st.markdown("---")
 st.markdown("### ⬇️ Download Comparison (Excel)")
 
-def rows_from_table_single(df: pd.DataFrame, section: str, side: str, group: str) -> List[Dict[str,str]]:
-    if df is None or df.empty: return []
-    return [{"Section": section, "Side": side, "Group": group, "Field": r["Field"], "Value": r["Value"]} for _, r in df.iterrows()]
-
 def rows_from_table(df: pd.DataFrame, section: str, group: str = "") -> List[Dict[str,str]]:
     if df is None or df.empty: return []
     return [{"Section": section, "Group": group, "Field": r["Field"], "Source": r["Source"], "Processed": r["Processed"]} for _, r in df.iterrows()]
 
-admin_df_rows = rows_from_table(admin_df, "Admin/Header")
-pat_df_rows = rows_from_table(pat_df, "Patient")
+admin_rows = rows_from_table(admin_df, "Admin/Header")
+patient_rows = rows_from_table(pat_df, "Patient")
 
-# Reporters sheet (sequential; two sides)
+# Reporter rows (paired)
 reporter_rows: List[Dict[str,str]] = []
-for i, rep in enumerate(src_reps, start=1):
-    df_side = make_reporter_table_one_side(rep)
-    reporter_rows += rows_from_table_single(df_side, "Reporter", "Source", f"Reporter {i}")
-for i, rep in enumerate(prc_reps, start=1):
-    df_side = make_reporter_table_one_side(rep)
-    reporter_rows += rows_from_table_single(df_side, "Reporter", "Processed", f"Reporter {i}")
+for i in range(max(len(src_reps), len(prc_reps))):
+    srep = src_reps[i] if i < len(src_reps) else {}
+    prep = prc_reps[i] if i < len(prc_reps) else {}
+    title = f"Reporter {i+1}"
+    r_df = make_reporter_pair_table(srep, prep)
+    reporter_rows += rows_from_table(r_df, "Reporter", group=title)
 
 # Drugs sheet (flatten)
 drug_rows = []
@@ -841,7 +815,7 @@ for key in all_evt_keys:
 
 def build_excel_bytes() -> Optional[bytes]:
     sheets: Dict[str, pd.DataFrame] = {}
-    sheets["Admin_Patient"] = pd.DataFrame(admin_df_rows + pat_df_rows)
+    sheets["Admin_Patient"] = pd.DataFrame(admin_rows + patient_rows)
     if reporter_rows: sheets["Reporters"] = pd.DataFrame(reporter_rows)
     if drug_rows:     sheets["Drugs"] = pd.DataFrame(drug_rows)
     if event_rows:    sheets["Events"] = pd.DataFrame(event_rows)
