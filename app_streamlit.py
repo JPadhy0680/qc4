@@ -1,573 +1,556 @@
-#!/usr/bin/env python3
-# qc_app_single.py
-# One-file Quality Reviewer + Streamlit UI
-# Author: M365 Copilot for Jagamohan Padhy
-
-import os
-import re
-import html
-import json
-import difflib
-import tempfile
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
-
+# qc_twofile_compare_tabular.py
 import streamlit as st
 import pandas as pd
-from xml.etree import ElementTree as ET
+import xml.etree.ElementTree as ET
+from datetime import datetime, date
+import io, re, calendar
+from typing import Optional, Dict, Any, List, Tuple, Set
 
-# Optional imports for document reading
-try:
-    from PyPDF2 import PdfReader
-except Exception:
-    PdfReader = None
+# ---------------- UI setup ----------------
+st.set_page_config(page_title="E2B_R3 Two-File Comparator (Tabular, Box-wise)", layout="wide")
+st.title("🧪📄📄 E2B_R3 Two‑File Comparator — Tabular, Box‑wise")
 
-try:
-    import docx  # python-docx
-except Exception:
-    docx = None
+# ---------------- Utilities ----------------
+NS = {'hl7': 'urn:hl7-org:v3', 'xsi': 'http://www.w3.org/2001/XMLSchema-instance'}
+UNKNOWN_TOKENS = {"unk", "asku", "unknown"}
+SENDER_ID_OID = "2.16.840.1.113883.3.989.2.1.3.1"
 
-# ----------------------------- Utilities -----------------------------
-
-def read_text_from_pdf(path: str) -> str:
-    if PdfReader is None:
-        raise RuntimeError("PyPDF2 not available to read PDFs.")
-    reader = PdfReader(path)
-    texts = []
-    for page in reader.pages:
-        try:
-            texts.append(page.extract_text() or "")
-        except Exception:
-            texts.append("")
-    return "\n".join(texts)
-
-def read_text_from_docx(path: str) -> str:
-    if docx is None:
-        raise RuntimeError("python-docx not available to read DOCX.")
-    d = docx.Document(path)
-    parts = []
-    for p in d.paragraphs:
-        parts.append(p.text)
-    for t in d.tables:
-        for row in t.rows:
-            parts.append("\t".join(cell.text for cell in row.cells))
-    return "\n".join(parts)
-
-def read_text_from_txt(path: str) -> str:
-    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-        return f.read()
-
-def read_csv_columns(path: str) -> pd.DataFrame:
-    try:
-        return pd.read_csv(path)
-    except Exception:
-        return pd.read_csv(path, encoding='latin-1')
-
-def read_table_df(path: str) -> pd.DataFrame:
-    ext = os.path.splitext(path)[1].lower()
-    if ext == '.csv':
-        return read_csv_columns(path)
-    if ext == '.xlsx':
-        return pd.read_excel(path, engine='openpyxl')
-    if ext == '.xls':
-        return pd.read_excel(path, engine='xlrd')
-    raise RuntimeError(f'Unsupported tabular file type: {ext}')
-
-def normalize_whitespace(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
-_punct_tbl = str.maketrans({c: "" for c in ('`~!@#$%^&*()-_=+[{]}\\|;:\'\",<.>/?')})
-
-def simple_remove_punct(s: str) -> str:
-    return (s or "").translate(_punct_tbl)
-
-def alnum_only(s: str) -> str:
-    return re.sub(r"[^0-9A-Za-z]", "", s or "")
-
-def to_lower(s: str) -> str:
-    return (s or "").lower()
-
-def to_upper(s: str) -> str:
-    return (s or "").upper()
-
-COMMON_DATE_FORMATS = [
-    "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d-%b-%Y", "%d %b %Y",
-    "%Y/%m/%d", "%b %d, %Y", "%d.%m.%Y", "%Y.%m.%d",
+TD_PATHS = [
+    './/hl7:transmissionWrapper/hl7:creationTime',
+    './/hl7:ControlActProcess/hl7:effectiveTime',
+    './/hl7:ClinicalDocument/hl7:effectiveTime',
+    './/hl7:creationTime',
 ]
 
-def parse_date(s: str) -> Optional[datetime]:
-    s = (s or "").strip()
-    if not s:
-        return None
-    for fmt in COMMON_DATE_FORMATS:
-        try:
-            return datetime.strptime(s, fmt)
-        except Exception:
-            pass
-    m = re.match(r"^(\d{4})(\d{2})(\d{2})$", s)
-    if m:
-        try:
-            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except Exception:
-            return None
-    return None
+# --- styling (simple card / box) ---
+BOX_CSS = """
+<style>
+.box {
+  border: 1px solid #e0e0e0; border-radius: 8px; padding: 10px 12px; margin: 8px 0;
+  background: #fafafa;
+}
+.box h5 { margin: 0 0 8px 0; }
+.diff { color: #b00020; font-weight: 600; } /* red text for mismatches */
+.smallnote { color:#666; font-size: 0.9em; }
+</style>
+"""
+st.markdown(BOX_CSS, unsafe_allow_html=True)
 
-# ----------------------------- Config Models -----------------------------
+def _digits_only(s: str) -> str:
+    return re.sub(r"\D", "", (s or "").strip())
 
-@dataclass
-class SourceSpec:
-    method: str  # 'regex' | 'csv_column'
-    pattern: Optional[str] = None
-    flags: List[str] = field(default_factory=list)
-    csv_column: Optional[str] = None
-
-@dataclass
-class XmlSpec:
-    xpath: str
-
-@dataclass
-class ComparisonSpec:
-    mode: str = "exact"  # exact | fuzzy | numeric | date | enum | bool
-    tolerance: Optional[float] = None
-    pct_tolerance: Optional[float] = None
-    date_tolerance_days: Optional[int] = None
-    fuzzy_threshold: float = 0.9
-
-@dataclass
-class FieldSpec:
-    name: str
-    type: str = "string"  # string, int, float, date, enum, bool
-    source: SourceSpec = None
-    xml: XmlSpec = None
-    normalize: List[str] = field(default_factory=list)
-    comparison: ComparisonSpec = field(default_factory=ComparisonSpec)
-    allowed_values: List[str] = field(default_factory=list)  # for enum
-
-# ----------------------------- Extraction -----------------------------
-
-def apply_normalizers(val: Optional[str], normalizers: List[str]) -> Optional[str]:
-    if val is None:
-        return None
-    s = val
-    for n in normalizers:
-        if n == 'strip':
-            s = s.strip()
-        elif n == 'lower':
-            s = to_lower(s)
-        elif n == 'upper':
-            s = to_upper(s)
-        elif n in ('collapse_whitespace', 'normalize_whitespace'):
-            s = normalize_whitespace(s)
-        elif n == 'alnum_only':
-            s = alnum_only(s)
-        elif n == 'remove_punctuation':
-            s = simple_remove_punct(s)
-    return s
-
-def compile_flags(flags: List[str]) -> int:
-    f = 0
-    for fl in flags or []:
-        u = fl.upper()
-        if u == 'IGNORECASE':
-            f |= re.IGNORECASE
-        elif u == 'MULTILINE':
-            f |= re.MULTILINE
-        elif u == 'DOTALL':
-            f |= re.DOTALL
-    return f
-
-def extract_from_source_text(text: str, spec: SourceSpec) -> Optional[str]:
-    if spec.method == 'regex':
-        if not spec.pattern:
-            return None
-        flags = compile_flags(spec.flags)
-        m = re.search(spec.pattern, text, flags)
-        if m:
-            if m.lastindex:
-                return m.group(1)
-            return m.group(0)
-        return None
-    raise ValueError(f"Unsupported source method for text: {spec.method}")
-
-def extract_from_source_csv(df: pd.DataFrame, spec: SourceSpec) -> Optional[str]:
-    if spec.method == 'csv_column':
-        if spec.csv_column and spec.csv_column in df.columns:
-            series = df[spec.csv_column].dropna()
-            if not series.empty:
-                return str(series.iloc[0])
-        return None
-    raise ValueError(f"Unsupported source method for csv: {spec.method}")
-
-def extract_from_xml(tree: ET.ElementTree, spec: XmlSpec) -> Optional[str]:
+def format_date(date_str: str) -> str:
+    if not date_str: return ""
+    digits = _digits_only(date_str)
     try:
-        node = tree.find(spec.xpath)
-        if node is None:
-            xp = spec.xpath
-            if xp.endswith('/text()'):
-                xp2 = xp[:-7]
-                node = tree.find(xp2)
-                if node is not None:
-                    return (node.text or '').strip()
-            return None
-        return (node.text or '').strip()
-    except Exception:
-        return None
-
-# ----------------------------- Comparison -----------------------------
-
-def compare_values(field: FieldSpec, src_val: Optional[str], xml_val: Optional[str]) -> Tuple[str, Dict[str, Any]]:
-    details: Dict[str, Any] = {
-        'field': field.name,
-        'type': field.type,
-        'comparator': field.comparison.mode,
-        'source_value': src_val,
-        'xml_value': xml_val,
-    }
-
-    if src_val is None and xml_val is None:
-        return 'NA', {**details, 'note': 'Both values missing'}
-    if src_val is None or xml_val is None:
-        return 'FAIL', {**details, 'note': 'One of the values is missing'}
-
-    src_n = apply_normalizers(src_val, field.normalize)
-    xml_n = apply_normalizers(xml_val, field.normalize)
-    mode = (field.comparison.mode or 'exact').lower()
-
-    if field.type in ('int', 'float') or mode == 'numeric':
-        try:
-            s_num = float(src_n)
-            x_num = float(xml_n)
-        except Exception:
-            return 'FAIL', {**details, 'note': 'Numeric parsing failed'}
-        tol = field.comparison.tolerance
-        pct = field.comparison.pct_tolerance
-        if tol is not None:
-            diff = abs(s_num - x_num)
-            ok = diff <= tol
-            return ('PASS' if ok else 'FAIL', {**details, 'diff': diff, 'tolerance': tol})
-        if pct is not None:
-            base = abs(s_num) if s_num != 0 else 1.0
-            diff_pct = abs(s_num - x_num) / base
-            ok = diff_pct <= pct
-            return ('PASS' if ok else 'FAIL', {**details, 'diff_pct': diff_pct, 'pct_tolerance': pct})
-        ok = s_num == x_num
-        return ('PASS' if ok else 'FAIL', {**details})
-
-    if field.type == 'date' or mode == 'date':
-        d1 = parse_date(src_n)
-        d2 = parse_date(xml_n)
-        if not d1 or not d2:
-            return 'FAIL', {**details, 'note': 'Date parsing failed'}
-        dtol = field.comparison.date_tolerance_days
-        if dtol is not None:
-            diff_days = abs((d1 - d2).days)
-            ok = diff_days <= dtol
-            return ('PASS' if ok else 'FAIL', {**details, 'diff_days': diff_days, 'tolerance_days': dtol})
-        ok = d1.date() == d2.date()
-        return ('PASS' if ok else 'FAIL', {**details})
-
-    if field.type == 'bool':
-        def to_bool(s: str) -> Optional[bool]:
-            sl = (s or '').strip().lower()
-            if sl in ('true','yes','y','1'): return True
-            if sl in ('false','no','n','0'): return False
-            return None
-        b1 = to_bool(src_n)
-        b2 = to_bool(xml_n)
-        if b1 is None or b2 is None:
-            return 'FAIL', {**details, 'note': 'Boolean parsing failed'}
-        ok = b1 == b2
-        return ('PASS' if ok else 'FAIL', {**details})
-
-    if field.type == 'enum':
-        if field.allowed_values:
-            if src_n not in field.allowed_values:
-                details['note'] = 'Source value not in allowed enum'
-            if xml_n not in field.allowed_values:
-                details['note'] = (details.get('note','')+'; ' if details.get('note') else '') + 'XML value not in allowed enum'
-        ok = src_n == xml_n
-        return ('PASS' if ok else 'FAIL', {**details})
-
-    if mode == 'fuzzy':
-        ratio = difflib.SequenceMatcher(a=src_n, b=xml_n).ratio()
-        thr = field.comparison.fuzzy_threshold or 0.9
-        ok = ratio >= thr
-        return ('PASS' if ok else 'FAIL', {**details, 'similarity': ratio, 'threshold': thr})
-
-    ok = src_n == xml_n
-    return ('PASS' if ok else 'FAIL', {**details})
-
-# ----------------------------- Engine (run_qc) -----------------------------
-
-def load_config(path: str) -> Dict[str, Any]:
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
-
-def build_field_specs(cfg: Dict[str, Any]) -> List[FieldSpec]:
-    fields_cfg = cfg.get('fields', [])
-    result: List[FieldSpec] = []
-    for f in fields_cfg:
-        source_cfg = f.get('source', {})
-        xml_cfg = f.get('xml', {})
-        comp_cfg = f.get('comparison', {})
-        fs = FieldSpec(
-            name=f.get('name'),
-            type=f.get('type', 'string'),
-            source=SourceSpec(method=source_cfg.get('method'),
-                              pattern=source_cfg.get('pattern'),
-                              flags=source_cfg.get('flags', []),
-                              csv_column=source_cfg.get('csv_column')),
-            xml=XmlSpec(xpath=xml_cfg.get('xpath')),
-            normalize=f.get('normalize', []),
-            comparison=ComparisonSpec(
-                mode=comp_cfg.get('mode', 'exact'),
-                tolerance=comp_cfg.get('tolerance'),
-                pct_tolerance=comp_cfg.get('pct_tolerance'),
-                date_tolerance_days=comp_cfg.get('date_tolerance_days'),
-                fuzzy_threshold=comp_cfg.get('fuzzy_threshold', 0.9),
-            ),
-            allowed_values=f.get('allowed_values', [])
-        )
-        result.append(fs)
-    return result
-
-def extract_source_values(source_path: str, fields: List[FieldSpec]) -> Dict[str, Optional[str]]:
-    ext = os.path.splitext(source_path)[1].lower()
-    text_cache: Optional[str] = None
-    table_df: Optional[pd.DataFrame] = None
-
-    def ensure_text():
-        nonlocal text_cache
-        if text_cache is not None:
-            return text_cache
-        if ext == '.pdf':
-            text_cache = read_text_from_pdf(source_path)
-        elif ext == '.docx':
-            text_cache = read_text_from_docx(source_path)
-        elif ext in ('.txt', '.text'):
-            text_cache = read_text_from_txt(source_path)
-        else:
-            raise RuntimeError(f"Unsupported source file type for text extraction: {ext}")
-        return text_cache
-
-    def ensure_table():
-        nonlocal table_df
-        if table_df is not None:
-            return table_df
-        table_df = read_table_df(source_path)
-        return table_df
-
-    out: Dict[str, Optional[str]] = {}
-    for f in fields:
-        try:
-            if f.source.method == 'regex':
-                txt = ensure_text()
-                out[f.name] = extract_from_source_text(txt, f.source)
-            elif f.source.method == 'csv_column':
-                if ext not in ('.csv', '.xlsx', '.xls'):
-                    raise RuntimeError("Configured for csv_column but source is not a CSV/Excel file")
-                df = ensure_table()
-                out[f.name] = extract_from_source_csv(df, f.source)
-            else:
-                out[f.name] = None
-        except Exception:
-            out[f.name] = None
-    return out
-
-def extract_xml_values(xml_path: str, fields: List[FieldSpec]) -> Dict[str, Optional[str]]:
-    tree = ET.parse(xml_path)
-    out: Dict[str, Optional[str]] = {}
-    for f in fields:
-        try:
-            out[f.name] = extract_from_xml(tree, f.xml)
-        except Exception:
-            out[f.name] = None
-    return out
-
-def generate_reports(results: List[Dict[str, Any]], outdir: str, base_name: str, formats: List[str], html_summary: bool = False) -> Dict[str, str]:
-    os.makedirs(outdir, exist_ok=True)
-    df = pd.DataFrame(results)
-    paths: Dict[str, str] = {}
-
-    if 'csv' in formats or 'all' in formats:
-        p = os.path.join(outdir, f"{base_name}_qc_report.csv")
-        df.to_csv(p, index=False)
-        paths['csv'] = p
-    if 'xlsx' in formats or 'all' in formats:
-        p = os.path.join(outdir, f"{base_name}_qc_report.xlsx")
-        with pd.ExcelWriter(p, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='QC Report')
-        paths['xlsx'] = p
-    if 'json' in formats or 'all' in formats:
-        p = os.path.join(outdir, f"{base_name}_qc_report.json")
-        df.to_json(p, orient='records', indent=2)
-        paths['json'] = p
-
-    if html_summary:
-        p = os.path.join(outdir, f"{base_name}_qc_summary.html")
-        passes = sum(1 for r in results if r.get('status') == 'PASS')
-        fails = sum(1 for r in results if r.get('status') == 'FAIL')
-        warns = sum(1 for r in results if r.get('status') == 'WARN')
-        nas = sum(1 for r in results if r.get('status') == 'NA')
-        total = len(results)
-        table_rows = []
-        for r in results:
-            stt = r.get('status')
-            color = {'PASS':'#d1fae5','FAIL':'#fee2e2','WARN':'#fef9c3','NA':'#e5e7eb'}.get(stt,'#ffffff')
-            row = (
-                f"<tr style='background:{color}'>"
-                f"<td>{html.escape(str(r.get('field')))}</td>"
-                f"<td>{html.escape(str(r.get('source_value')))}</td>"
-                f"<td>{html.escape(str(r.get('xml_value')))}</td>"
-                f"<td>{html.escape(str(stt))}</td>"
-                f"<td>{html.escape(str(r.get('comparator')))}</td>"
-                f"<td>{html.escape(str(r.get('note', '')))}</td>"
-                f"</tr>"
-            )
-            table_rows.append(row)
-        html_doc = f"""
-        <html><head><meta charset='utf-8'><title>QC Summary</title>
-        <style>body{{font-family:Arial, sans-serif}} table{{border-collapse:collapse;width:100%}} td,th{{border:1px solid #ddd;padding:8px}}</style>
-        </head><body>
-        <h2>Quality Review Summary</h2>
-        <p><b>Total:</b> {total} | <b>PASS:</b> {passes} | <b>FAIL:</b> {fails} | <b>WARN:</b> {warns} | <b>NA:</b> {nas}</p>
-        <table><thead><tr><th>Field</th><th>Source</th><th>XML</th><th>Status</th><th>Comparator</th><th>Notes</th></tr></thead>
-        <tbody>
-        {''.join(table_rows)}
-        </tbody></table>
-        </body></html>
-        """
-        with open(p, 'w', encoding='utf-8') as f:
-            f.write(html_doc)
-        paths['html'] = p
-
-    return paths
-
-def run_qc(source_path: str, xml_path: str, config_path: str, outdir: str, report_format: str, html_summary: bool) -> Dict[str, str]:
-    cfg = load_config(config_path)
-    fields = build_field_specs(cfg)
-
-    src_vals = extract_source_values(source_path, fields)
-    xml_vals = extract_xml_values(xml_path, fields)
-
-    results: List[Dict[str, Any]] = []
-    for f in fields:
-        s_val = src_vals.get(f.name)
-        x_val = xml_vals.get(f.name)
-        status, detail = compare_values(f, s_val, x_val)
-        results.append({**detail, 'status': status})
-
-    base = os.path.splitext(os.path.basename(source_path))[0] + "__" + os.path.splitext(os.path.basename(xml_path))[0]
-    fmts = ['csv'] if report_format == 'csv' else ['xlsx'] if report_format == 'xlsx' else ['json'] if report_format == 'json' else ['all']
-    paths = generate_reports(results, outdir, base, fmts, html_summary)
-    return paths
-
-# ----------------------------- Streamlit UI -----------------------------
-
-st.set_page_config(page_title="Quality Reviewer", layout="wide")
-st.title("Quality Reviewer (Source vs Processed XML)")
-st.caption("Upload a source document and a processed XML, provide a config, and generate a QC report.")
-
-with st.sidebar:
-    st.header("Settings")
-    report_format = st.selectbox("Report format", ["all", "xlsx", "csv", "json"], index=0)
-    gen_html = st.checkbox("Generate HTML summary", value=True)
-    outdir_name = st.text_input("Output folder name", value=f"qc_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-
-col1, col2, col3 = st.columns(3)
-source_file = col1.file_uploader("Source (PDF/DOCX/TXT/CSV/XLSX/XLS)", type=["pdf","docx","txt","csv","xlsx","xls"])
-xml_file = col2.file_uploader("Processed XML", type=["xml"])
-config_file = col3.file_uploader("Config (JSON)", type=["json"])
-
-def _infer_mime(path: str) -> str:
-    p = path.lower()
-    if p.endswith(".csv"):
-        return "text/csv"
-    if p.endswith(".json"):
-        return "application/json"
-    if p.endswith(".xlsx"):
-        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    if p.endswith(".html"):
-        return "text/html"
-    return "application/octet-stream"
-
-def _preview_config(cfg_bytes: bytes):
-    try:
-        txt = cfg_bytes.decode("utf-8", errors="ignore")
-        obj = json.loads(txt)
-        st.markdown("**Config (JSON) preview:**")
-        pretty = json.dumps(obj, indent=2)
-        st.code(pretty[:2000] + ("..." if len(pretty) > 2000 else ""), language="json")
+        if len(digits) >= 8:
+            return datetime.strptime(digits[:8], "%Y%m%d").strftime("%d-%b-%Y")
+        elif len(digits) >= 6:
+            return datetime.strptime(digits[:6], "%Y%m").strftime("%b-%Y")
+        elif len(digits) >= 4:
+            return digits[:4]
     except Exception:
         pass
+    return ""
 
-if st.button("Run Quality Check", use_container_width=True):
-    if not (source_file and xml_file and config_file):
-        st.error("Please upload Source, XML, and Config files.")
-        st.stop()
+def parse_date_obj(date_str: str) -> Optional[date]:
+    if not date_str: return None
+    digits = _digits_only(date_str)
+    try:
+        if len(digits) >= 8:
+            return datetime.strptime(digits[:8], "%Y%m%d").date()
+        elif len(digits) >= 6:
+            y, m = int(digits[:4]), int(digits[4:6])
+            last = calendar.monthrange(y, m)[1]
+            return date(y, m, last)
+        elif len(digits) >= 4:
+            y = int(digits[:4]); return date(y, 12, 31)
+    except Exception:
+        pass
+    return None
 
-    with st.expander("Uploaded files"):
-        st.write({
-            "source": source_file.name if source_file else None,
-            "xml": xml_file.name if xml_file else None,
-            "config": config_file.name if config_file else None
-        })
-        _preview_config(config_file.getvalue())
+def clean_value(v: Any) -> str:
+    if v is None: return ""
+    s = str(v).strip()
+    return "" if (not s or s.lower() in UNKNOWN_TOKENS) else s
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Save uploads
-        src_path = os.path.join(tmpdir, source_file.name)
-        with open(src_path, "wb") as f:
-            f.write(source_file.read())
-        xml_path = os.path.join(tmpdir, xml_file.name)
-        with open(xml_path, "wb") as f:
-            f.write(xml_file.read())
-        cfg_path = os.path.join(tmpdir, config_file.name)
-        with open(cfg_path, "wb") as f:
-            f.write(config_file.read())
+def normalize_text(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r'[^a-z0-9\s\+\-]', ' ', s)
+    return re.sub(r'\s+', ' ', s).strip()
 
-        outdir = os.path.join(tmpdir, outdir_name)
+def map_gender(code: str) -> str:
+    return {"1":"Male", "2":"Female", "M":"Male", "F":"Female"}.get(code, "Unknown")
 
-        with st.spinner("Running QC..."):
-            try:
-                paths = run_qc(src_path, xml_path, cfg_path, outdir, report_format, gen_html)
-            except Exception as e:
-                st.error("QC failed. See details below:")
-                st.exception(e)
-                st.stop()
+def get_text(elem) -> str:
+    return clean_value(elem.text) if (elem is not None and elem.text) else ""
 
-        st.success("QC complete. Download your outputs below.")
+def find_first(root, xpath) -> Optional[ET.Element]:
+    return root.find(xpath, NS)
 
-        # Download buttons
-        if not paths:
-            st.warning("No outputs were generated. Please check your config/inputs.")
+def findall(root, xpath) -> List[ET.Element]:
+    return root.findall(xpath, NS)
+
+def mismatch_marker(a: Any, b: Any, is_date=False) -> str:
+    if is_date:
+        da, db = parse_date_obj(a or ""), parse_date_obj(b or "")
+        if da == db and da is not None:
+            return ""
+    return " 🔴" if (str(a) or "") != (str(b) or "") else ""
+
+def has_value(x: str) -> bool:
+    return bool((x or "").strip())
+
+def safe_disp(v: str) -> str:
+    return v if v else "—"
+
+# ---------------- Canonical extraction ----------------
+def extract_sender_id(root: ET.Element) -> str:
+    e = find_first(root, f'.//hl7:id[@root="{SENDER_ID_OID}"]')
+    return clean_value(e.attrib.get('extension', '')) if e is not None else ""
+
+def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
+    out = {"TD_raw":"", "TD":"", "FRD_raw":"", "FRD":"", "LRD_raw":"", "LRD":""}
+    # TD (priority)
+    for p in TD_PATHS:
+        e = find_first(root, p)
+        if e is not None:
+            val = e.attrib.get('value') or get_text(e)
+            if val:
+                out["TD_raw"] = val; out["TD"] = format_date(val)
+                break
+    # LRD: explicit availabilityTime (first)
+    for el in root.iter():
+        ln = el.tag.split('}')[-1] if '}' in el.tag else el.tag
+        if ln == 'availabilityTime':
+            v = el.attrib.get('value')
+            if v:
+                out["LRD_raw"] = v; out["LRD"] = format_date(v); break
+    # FRD: earliest <low>
+    lows = []
+    for el in root.iter():
+        ln = el.tag.split('}')[-1] if '}' in el.tag else el.tag
+        if ln == 'low':
+            v = el.attrib.get('value')
+            if v: lows.append(v)
+    if lows:
+        pairs = [(parse_date_obj(v), v) for v in lows if parse_date_obj(v)]
+        if pairs:
+            pairs.sort(key=lambda t: t[0])
+            out["FRD_raw"] = pairs[0][1]; out["FRD"] = format_date(pairs[0][1])
+    return out
+
+def extract_patient(root: ET.Element) -> Dict[str, str]:
+    gender_elem = find_first(root, './/hl7:administrativeGenderCode')
+    gender_code = gender_elem.attrib.get('code', '') if gender_elem is not None else ''
+    gender = clean_value(map_gender(gender_code))
+
+    age_elem = find_first(root, './/hl7:code[@displayName="age"]/../hl7:value')
+    age_val = age_elem.attrib.get('value','') if age_elem is not None else ''
+    age_unit_raw = age_elem.attrib.get('unit','') if age_elem is not None else ''
+    unit = {'a':'year', 'b':'month'}.get(str(age_unit_raw).lower(), age_unit_raw)
+    age = f"{clean_value(age_val)}{(' ' + clean_value(unit)) if clean_value(age_val) and clean_value(unit) else ''}".strip()
+
+    age_group_map = {"0":"Foetus","1":"Neonate","2":"Infant","3":"Child","4":"Adolescent","5":"Adult","6":"Elderly"}
+    ag_elem = find_first(root, './/hl7:code[@displayName="ageGroup"]/../hl7:value')
+    age_group = ""
+    if ag_elem is not None:
+        c = ag_elem.attrib.get('code','')
+        nf = ag_elem.attrib.get('nullFlavor','')
+        age_group = age_group_map.get(c, "[Masked/Unknown]" if (c in ["MSK","UNK","ASKU","NI"] or nf in ["MSK","UNK","ASKU","NI"]) else "")
+
+    weight_elem = find_first(root, './/hl7:code[@displayName="bodyWeight"]/../hl7:value')
+    weight = ""
+    if weight_elem is not None:
+        wv = clean_value(weight_elem.attrib.get('value',''))
+        wu = clean_value(weight_elem.attrib.get('unit',''))
+        weight = f"{wv}{(' ' + wu) if wv and wu else ''}"
+
+    height_elem = find_first(root, './/hl7:code[@displayName="height"]/../hl7:value')
+    height = ""
+    if height_elem is not None:
+        hv = clean_value(height_elem.attrib.get('value',''))
+        hu = clean_value(height_elem.attrib.get('unit',''))
+        height = f"{hv}{(' ' + hu) if hv and hu else ''}"
+
+    # Initials
+    initials = ""
+    nm = find_first(root, './/hl7:player1/hl7:name')
+    if nm is not None:
+        if nm.attrib.get('nullFlavor') == 'MSK':
+            initials = "Masked"
         else:
-            for key, p in paths.items():
-                label = f"Download {key.upper()} report"
-                with open(p, "rb") as fh:
-                    st.download_button(
-                        label=label,
-                        data=fh.read(),
-                        file_name=os.path.basename(p),
-                        mime=_infer_mime(p),
-                        use_container_width=True
-                    )
+            parts = []
+            for g in nm.findall('hl7:given', NS):
+                if g.text and g.text.strip(): parts.append(g.text.strip()[0].upper())
+            fam = nm.find('hl7:family', NS)
+            if fam is not None and fam.text and fam.text.strip(): parts.append(fam.text.strip()[0].upper())
+            initials = "".join(parts) or clean_value(get_text(nm))
+    return {
+        "Gender": clean_value(gender), "Age": clean_value(age), "Age Group": clean_value(age_group),
+        "Height": clean_value(height), "Weight": clean_value(weight), "Initials": clean_value(initials),
+    }
 
-        # Preview
-        if "csv" in paths and paths["csv"].endswith(".csv"):
-            try:
-                df = pd.read_csv(paths["csv"])
-                st.subheader("QC Report Preview")
-                st.dataframe(df, use_container_width=True)
-            except Exception:
-                pass
-        elif "json" in paths and paths["json"].endswith(".json"):
-            try:
-                df = pd.read_json(paths["json"])
-                st.subheader("QC Report Preview")
-                st.dataframe(df, use_container_width=True)
-            except Exception:
-                pass
+def extract_suspect_ids(root: ET.Element) -> Set[str]:
+    out = set()
+    for c in findall(root, './/hl7:causalityAssessment'):
+        v = find_first(c, './/hl7:value')
+        if v is not None and v.attrib.get('code') == '1':
+            sid = find_first(c, './/hl7:subject2/hl7:productUseReference/hl7:id')
+            if sid is not None:
+                out.add(sid.attrib.get('root',''))
+    return out
 
-st.caption("Tip: For scanned PDFs (no text layer), run OCR first or provide DOCX/TXT/CSV/XLSX.")
+def extract_products(root: ET.Element) -> List[Dict[str, str]]:
+    suspects = extract_suspect_ids(root)
+    products = []
+    for drug in findall(root, './/hl7:substanceAdministration'):
+        id_elem = find_first(drug, './/hl7:id')
+        drug_id = id_elem.attrib.get('root','') if id_elem is not None else ''
+        if drug_id in suspects:  # only suspects
+            # name
+            nm = find_first(drug, './/hl7:kindOfProduct/hl7:name')
+            raw_name = ""
+            if nm is not None:
+                raw_name = (nm.text or "").strip() or clean_value(nm.attrib.get('displayName', ''))
+                if not raw_name:
+                    ot = nm.find('hl7:originalText', NS)
+                    raw_name = get_text(ot)
+            if not raw_name:
+                alt = find_first(drug, './/hl7:manufacturedProduct/hl7:name')
+                raw_name = get_text(alt)
+
+            # dose text/value/unit
+            txt = get_text(find_first(drug, './/hl7:text'))
+            dq = find_first(drug, './/hl7:doseQuantity')
+            dose_v = dq.attrib.get('value','') if dq is not None else ''
+            dose_u = dq.attrib.get('unit','') if dq is not None else ''
+
+            # dates
+            low = find_first(drug, './/hl7:low'); high = find_first(drug, './/hl7:high')
+            sd_raw = low.attrib.get('value','') if low is not None else ''
+            ed_raw = high.attrib.get('value','') if high is not None else ''
+
+            # form / lot / MAH
+            form = get_text(find_first(drug, './/hl7:formCode/hl7:originalText'))
+            lot = get_text(find_first(drug, './/hl7:lotNumberText'))
+            mah = ""
+            for p in [
+                './/hl7:playingOrganization/hl7:name',
+                './/hl7:manufacturerOrganization/hl7:name',
+                './/hl7:asManufacturedProduct/hl7:manufacturerOrganization/hl7:name',
+            ]:
+                node = find_first(drug, p)
+                if node is not None and get_text(node):
+                    mah = get_text(node); break
+
+            products.append({
+                "Drug": clean_value(raw_name),
+                "Dosage Text": clean_value(txt),
+                "Dose Value": clean_value(dose_v),
+                "Dose Unit": clean_value(dose_u),
+                "Start Date (raw)": sd_raw, "Start Date": format_date(sd_raw),
+                "Stop Date (raw)": ed_raw, "Stop Date": format_date(ed_raw),
+                "Formulation": clean_value(form),
+                "Lot No": clean_value(lot),
+                "MAH": clean_value(mah),
+                "_key": normalize_text(raw_name) if raw_name else "",  # for matching
+            })
+    return products
+
+def extract_events(root: ET.Element) -> List[Dict[str, Any]]:
+    out = []
+    for rxn in findall(root, './/hl7:observation'):
+        code = find_first(rxn, 'hl7:code')
+        if code is not None and code.attrib.get('displayName') == 'reaction':
+            val = find_first(rxn, 'hl7:value')
+            llt_code = val.attrib.get('code','') if val is not None else ''
+            llt_term = val.attrib.get('displayName','') if val is not None else ''
+
+            ser_map = {
+                "resultsInDeath":"Death",
+                "isLifeThreatening":"LT",
+                "requiresInpatientHospitalization":"Hospital",
+                "resultsInPersistentOrSignificantDisability":"Disability",
+                "congenitalAnomalyBirthDefect":"Congenital",
+                "otherMedicallyImportantCondition":"IME"
+            }
+            flags = []
+            for k, lbl in ser_map.items():
+                crit = find_first(rxn, f'.//hl7:code[@displayName="{k}"]/../hl7:value')
+                if crit is not None and crit.attrib.get('value') == 'true':
+                    flags.append(lbl)
+
+            outcome_elem = find_first(rxn, './/hl7:code[@displayName="outcome"]/../hl7:value')
+            outcome_code = outcome_elem.attrib.get('code','') if outcome_elem is not None else ''
+            outcome_map = {
+                "1":"Recovered/Resolved","2":"Recovering/Resolving","3":"Not recovered/Ongoing",
+                "4":"Recovered with sequelae","5":"Fatal","0":"Unknown"
+            }
+            outcome = outcome_map.get(outcome_code, "Unknown")
+
+            low = find_first(rxn, './/hl7:effectiveTime/hl7:low')
+            high = find_first(rxn, './/hl7:effectiveTime/hl7:high')
+            sd_raw = low.attrib.get('value','') if low is not None else ''
+            ed_raw = high.attrib.get('value','') if high is not None else ''
+
+            out.append({
+                "LLT Code": clean_value(llt_code),
+                "LLT Term": clean_value(llt_term),
+                "Seriousness": "Non-serious" if not flags else ", ".join(sorted(set(flags))),
+                "Outcome": clean_value(outcome),
+                "Event Start (raw)": sd_raw, "Event Start": format_date(sd_raw),
+                "Event End (raw)": ed_raw, "Event End": format_date(ed_raw),
+                "_key": clean_value(llt_code) or normalize_text(llt_term),
+            })
+    return out
+
+def extract_narrative(root: ET.Element) -> str:
+    narrative_elem = root.find('.//hl7:code[@code="PAT_ADV_EVNT"]/../hl7:text', NS)
+    return clean_value(narrative_elem.text if narrative_elem is not None else '')
+
+def extract_model(xml_bytes: bytes) -> Dict[str, Any]:
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception as e:
+        return {"_error": f"XML parse error: {e}"}
+    model: Dict[str, Any] = {}
+    model["Sender ID"] = extract_sender_id(root)
+    model.update(extract_td_frd_lrd(root))  # TD/FRD/LRD (store raw & formatted)
+    model["Patient"] = extract_patient(root)
+    model["Products"] = extract_products(root)
+    model["Events"] = extract_events(root)
+    model["Narrative"] = extract_narrative(root)
+    return model
+
+# --------------- Helpers to build comparison tables (ONLY non-blank rows) ----------------
+def compare_table(rows: List[Tuple[str, str, str]], treat_as_dates: bool = False) -> pd.DataFrame:
+    """
+    rows = [(Field, source_value, processed_value), ...]
+    - Skips any row where BOTH source and processed are blank.
+    - Adds 🔴 marker on processed when values differ (date-equivalent differences are not marked if treat_as_dates=True).
+    """
+    disp = []
+    for field, s, p in rows:
+        s_str = (s or "").strip()
+        p_str = (p or "").strip()
+        if not s_str and not p_str:
+            continue  # skip fully blank row
+        marker = mismatch_marker(s, p, is_date=treat_as_dates)
+        disp.append({"Field": field, "Source": safe_disp(s_str), "Processed": safe_disp(p_str) + marker})
+    return pd.DataFrame(disp) if disp else pd.DataFrame(columns=["Field","Source","Processed"])
+
+def make_admin_table(src: Dict[str,Any], prc: Dict[str,Any]) -> pd.DataFrame:
+    rows = [
+        ("Sender ID", src.get("Sender ID",""), prc.get("Sender ID","")),
+        ("TD",        src.get("TD","") or format_date(src.get("TD_raw","")), prc.get("TD","") or format_date(prc.get("TD_raw",""))),
+        ("FRD",       src.get("FRD","") or format_date(src.get("FRD_raw","")), prc.get("FRD","") or format_date(prc.get("FRD_raw",""))),
+        ("LRD",       src.get("LRD","") or format_date(src.get("LRD_raw","")), prc.get("LRD","") or format_date(prc.get("LRD_raw",""))),
+    ]
+    return compare_table(rows, treat_as_dates=True)
+
+def make_patient_table(src: Dict[str,str], prc: Dict[str,str]) -> pd.DataFrame:
+    fields = ["Gender","Age","Age Group","Height","Weight","Initials"]
+    rows = [(f, src.get(f,""), prc.get(f,"")) for f in fields]
+    return compare_table(rows, treat_as_dates=False)
+
+def dict_by_key(items: List[Dict[str,Any]]) -> Dict[str, Dict[str,Any]]:
+    return {it.get("_key",""): it for it in items if it.get("_key","")}
+
+def make_product_box(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
+    st.markdown(f'<div class="box"><h5>Drug: {title}</h5>', unsafe_allow_html=True)
+    fields = [
+        ("Dosage Text","text"),
+        ("Dose Value","text"),
+        ("Dose Unit","text"),
+        ("Start Date","date"),
+        ("Stop Date","date"),
+        ("Formulation","text"),
+        ("Lot No","text"),
+        ("MAH","text"),
+    ]
+    rows = []
+    for field, kind in fields:
+        s_val = src_rec.get(field,"")
+        p_val = prc_rec.get(field,"")
+        if kind == "date":
+            s_val = s_val or format_date(src_rec.get(field + " (raw)",""))
+            p_val = p_val or format_date(prc_rec.get(field + " (raw)",""))
+        rows.append((field, s_val, p_val))
+    df = compare_table(rows, treat_as_dates=True)
+    if df.empty:
+        st.markdown('<div class="smallnote">No values to display for this drug in either file.</div>', unsafe_allow_html=True)
+    else:
+        st.table(df)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def make_event_box(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
+    st.markdown(f'<div class="box"><h5>Event: {title}</h5>', unsafe_allow_html=True)
+    fields = [
+        ("LLT Code","text"),
+        ("LLT Term","text"),
+        ("Seriousness","text"),
+        ("Outcome","text"),
+        ("Event Start","date"),
+        ("Event End","date"),
+    ]
+    rows = []
+    for field, kind in fields:
+        s_val = src_rec.get(field,"")
+        p_val = prc_rec.get(field,"")
+        if kind == "date":
+            s_val = s_val or format_date(src_rec.get(field + " (raw)",""))
+            p_val = p_val or format_date(prc_rec.get(field + " (raw)",""))
+        rows.append((field, s_val, p_val))
+    df = compare_table(rows, treat_as_dates=True)
+    if df.empty:
+        st.markdown('<div class="smallnote">No values to display for this event in either file.</div>', unsafe_allow_html=True)
+    else:
+        st.table(df)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# ---------------- UI: Upload & Parse ----------------
+st.markdown("### 📤 Upload the two XML files you want to compare (no ID pairing; exact files compared)")
+c1, c2 = st.columns(2)
+with c1:
+    src_file = st.file_uploader("Source XML", type=["xml"], key="src_xml")
+with c2:
+    prc_file = st.file_uploader("Processed XML", type=["xml"], key="prc_xml")
+
+if not (src_file and prc_file):
+    st.info("Please upload **both** Source and Processed XML files to view the tabular comparison.")
+    st.stop()
+
+with st.spinner("Parsing Source..."):
+    src = extract_model(src_file.read())
+with st.spinner("Parsing Processed..."):
+    prc = extract_model(prc_file.read())
+
+if src.get("_error") or prc.get("_error"):
+    st.error(f"Source error: {src.get('_error','-')}\nProcessed error: {prc.get('_error','-')}")
+    st.stop()
+
+# ---------------- SECTION: Admin/Header ----------------
+st.subheader("Admin / Header")
+admin_df = make_admin_table(src, prc)
+if admin_df.empty:
+    st.markdown('<div class="box smallnote">No header/admin values present in either file.</div>', unsafe_allow_html=True)
+else:
+    st.table(admin_df)
+
+# ---------------- SECTION: Patient Details ----------------
+st.subheader("Patient Details")
+pat_df = make_patient_table(src.get("Patient",{}), prc.get("Patient",{}))
+if pat_df.empty:
+    st.markdown('<div class="box smallnote">No patient values present in either file.</div>', unsafe_allow_html=True)
+else:
+    st.table(pat_df)
+
+# ---------------- SECTION: Drug Details (matched by drug name) ----------------
+st.subheader("Drug Details (suspects) — matched by drug name")
+src_prods = src.get("Products", [])
+prc_prods = prc.get("Products", [])
+src_idx = dict_by_key(src_prods)
+prc_idx = dict_by_key(prc_prods)
+all_keys = sorted(set(src_idx) | set(prc_idx))
+
+if not all_keys:
+    st.markdown('<div class="box smallnote">No suspect products found in either file.</div>', unsafe_allow_html=True)
+else:
+    for key in all_keys:
+        srec = src_idx.get(key, {"Drug": ""})
+        prec = prc_idx.get(key, {"Drug": ""})
+        title = srec.get("Drug") or prec.get("Drug") or "(Unnamed drug)"
+        make_product_box(srec, prec, title)
+
+# ---------------- SECTION: Event Details (matched by LLT Code then term) ----------------
+st.subheader("Event Details — matched by LLT code (fallback: normalized term)")
+src_evts = src.get("Events", [])
+prc_evts = prc.get("Events", [])
+def idx_events(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
+    return {e.get("_key",""): e for e in lst if e.get("_key","")}
+src_evt_idx = idx_events(src_evts)
+prc_evt_idx = idx_events(prc_evts)
+all_evt_keys = sorted(set(src_evt_idx) | set(prc_evt_idx))
+
+if not all_evt_keys:
+    st.markdown('<div class="box smallnote">No events found in either file.</div>', unsafe_allow_html=True)
+else:
+    for key in all_evt_keys:
+        se = src_evt_idx.get(key, {"LLT Term": ""})
+        pe = prc_evt_idx.get(key, {"LLT Term": ""})
+        title = se.get("LLT Term") or pe.get("LLT Term") or (se.get("LLT Code") or pe.get("LLT Code") or "(Unnamed event)")
+        make_event_box(se, pe, title)
+
+# ---------------- SECTION: Narrative (optional) ----------------
+st.subheader("Narrative")
+show_full = st.checkbox("Show full narrative (may be long)", value=True)
+max_len = None if show_full else 1000
+src_narr_full = src.get("Narrative","")
+prc_narr_full = prc.get("Narrative","")
+src_narr = src_narr_full[:max_len] if max_len else src_narr_full
+prc_narr = prc_narr_full[:max_len] if max_len else prc_narr_full
+
+if not has_value(src_narr_full) and not has_value(prc_narr_full):
+    st.markdown('<div class="box smallnote">No narrative present in either file.</div>', unsafe_allow_html=True)
+else:
+    st.markdown('<div class="box"><h5>Source</h5>', unsafe_allow_html=True)
+    st.code(src_narr or "—")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="box"><h5>Processed</h5>', unsafe_allow_html=True)
+    suffix = " 🔴" if (src_narr_full != prc_narr_full) else ""
+    st.code((prc_narr or "—") + suffix)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# ---------------- Export (only non-blank rows) ----------------
+st.markdown("---")
+st.markdown("### ⬇️ Download Comparison (Excel)")
+def rows_from_table(df: pd.DataFrame, section: str) -> List[Dict[str,str]]:
+    out = []
+    if df is None or df.empty:
+        return out
+    for _, r in df.iterrows():
+        out.append({"Section": section, "Field": r["Field"], "Source": r["Source"], "Processed": r["Processed"]})
+    return out
+
+admin_rows = rows_from_table(admin_df, "Admin/Header")
+pat_rows = rows_from_table(pat_df, "Patient")
+
+# Drugs sheet
+prod_rows = []
+for key in all_keys:
+    srec = src_idx.get(key, {})
+    prec = prc_idx.get(key, {})
+    title = srec.get("Drug") or prec.get("Drug") or "(Unnamed drug)"
+    for field in ["Dosage Text","Dose Value","Dose Unit","Start Date","Stop Date","Formulation","Lot No","MAH"]:
+        s_val = srec.get(field, "") or (format_date(srec.get(field + " (raw)","")) if "Date" in field else "")
+        p_val = prec.get(field, "") or (format_date(prec.get(field + " (raw)","")) if "Date" in field else "")
+        if has_value(s_val) or has_value(p_val):
+            prod_rows.append({"Section":"Drug", "Group": title, "Field": field, "Source": s_val or "—", "Processed": p_val or "—"})
+
+# Events sheet
+evt_rows = []
+for key in all_evt_keys:
+    se = src_evt_idx.get(key, {})
+    pe = prc_evt_idx.get(key, {})
+    title = se.get("LLT Term") or pe.get("LLT Term") or (se.get("LLT Code") or pe.get("LLT Code") or "(Unnamed event)")
+    for field in ["LLT Code","LLT Term","Seriousness","Outcome","Event Start","Event End"]:
+        s_val = se.get(field, "") or (format_date(se.get(field + " (raw)","")) if "Event" in field else "")
+        p_val = pe.get(field, "") or (format_date(pe.get(field + " (raw)","")) if "Event" in field else "")
+        if has_value(s_val) or has_value(p_val):
+            evt_rows.append({"Section":"Event", "Group": title, "Field": field, "Source": s_val or "—", "Processed": p_val or "—"})
+
+excel_buffer = io.BytesIO()
+with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+    pd.DataFrame(admin_rows + pat_rows).to_excel(writer, index=False, sheet_name="Admin_Patient")
+    if prod_rows:
+        pd.DataFrame(prod_rows).to_excel(writer, index=False, sheet_name="Drugs")
+    if evt_rows:
+        pd.DataFrame(evt_rows).to_excel(writer, index=False, sheet_name="Events")
+    if has_value(src.get("Narrative","")) or has_value(prc.get("Narrative","")):
+        pd.DataFrame([{"Source Narrative": src.get("Narrative","") or "—",
+                       "Processed Narrative": prc.get("Narrative","") or "—"}]).to_excel(writer, index=False, sheet_name="Narrative")
+
+st.download_button("Download qc_twofile_compare_tabular.xlsx", excel_buffer.getvalue(), "qc_twofile_compare_tabular.xlsx")
+``
