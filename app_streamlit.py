@@ -341,13 +341,28 @@ def compare_table(rows: List[Tuple[str, str, str]], treat_as_dates: bool = False
     return pd.DataFrame(disp) if disp else pd.DataFrame(columns=["Field","Source","Processed"])
 
 def make_admin_table(src: Dict[str,Any], prc: Dict[str,Any]) -> pd.DataFrame:
-    rows = [
-        ("Sender ID", src.get("Sender ID",""), prc.get("Sender ID","")),
-        ("TD",        src.get("TD","") or format_date(src.get("TD_raw","")), prc.get("TD","") or format_date(prc.get("TD_raw",""))),
-        ("FRD",       src.get("FRD","") or format_date(src.get("FRD_raw","")), prc.get("FRD","") or format_date(prc.get("FRD_raw",""))),
-        ("LRD",       src.get("LRD","") or format_date(src.get("LRD_raw","")), prc.get("LRD","") or format_date(prc.get("LRD_raw",""))),
-    ]
-    return compare_table(rows, treat_as_dates=True)
+    """
+    Admin/Header section shows two rows:
+      1) Sender ID
+      2) Day Zero = Source: TD   |   Processed: LRD
+    """
+    # Row 1: Sender ID (plain text compare)
+    df_sender = compare_table(
+        [("Sender ID", src.get("Sender ID",""), prc.get("Sender ID",""))],
+        treat_as_dates=False
+    )
+
+    # Row 2: Day Zero (dates compare; Source TD vs Processed LRD)
+    src_td_disp = src.get("TD", "") or format_date(src.get("TD_raw", ""))
+    prc_lrd_disp = prc.get("LRD", "") or format_date(prc.get("LRD_raw", ""))
+    df_day_zero = compare_table(
+        [("Day Zero", src_td_disp, prc_lrd_disp)],
+        treat_as_dates=True
+    )
+
+    if df_sender.empty and df_day_zero.empty:
+        return pd.DataFrame(columns=["Field","Source","Processed"])
+    return pd.concat([df_sender, df_day_zero], ignore_index=True)
 
 def make_patient_table(src: Dict[str,str], prc: Dict[str,str]) -> pd.DataFrame:
     fields = ["Gender","Age","Age Group","Height","Weight","Initials"]
@@ -430,7 +445,7 @@ if src.get("_error") or prc.get("_error"):
     st.error(f"Source error: {src.get('_error','-')}\nProcessed error: {prc.get('_error','-')}")
     st.stop()
 
-# ---------------- SECTION: Admin/Header ----------------
+# ---------------- SECTION: Admin/Header (Sender ID + Day Zero) ----------------
 st.subheader("Admin / Header")
 admin_df = make_admin_table(src, prc)
 if admin_df.empty:
@@ -514,7 +529,7 @@ def rows_from_table(df: pd.DataFrame, section: str) -> List[Dict[str,str]]:
         out.append({"Section": section, "Field": r["Field"], "Source": r["Source"], "Processed": r["Processed"]})
     return out
 
-admin_rows = rows_from_table(admin_df, "Admin/Header")
+admin_rows = rows_from_table(admin_df, "Admin/Header")  # includes Sender ID and Day Zero
 pat_rows = rows_from_table(pat_df, "Patient")
 
 # Drugs sheet
@@ -553,4 +568,3 @@ with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
                        "Processed Narrative": prc.get("Narrative","") or "—"}]).to_excel(writer, index=False, sheet_name="Narrative")
 
 st.download_button("Download qc_twofile_compare_tabular.xlsx", excel_buffer.getvalue(), "qc_twofile_compare_tabular.xlsx")
-
