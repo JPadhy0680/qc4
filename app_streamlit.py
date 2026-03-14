@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any, List, Tuple, Set
 st.set_page_config(page_title="E2B_R3 Two-File Comparator (Tabular, Box-wise)", layout="wide")
 st.title("🧪📄📄 E2B_R3 Two‑File Comparator — Tabular, Box‑wise")
 
-# Optional debug controls (Events parsing warnings)
+# Optional debug control (Events parsing warnings)
 DEBUG_EVENTS = st.sidebar.checkbox("Debug events parsing", value=False)
 
 # ---------------- Utilities ----------------
@@ -23,7 +23,9 @@ WWID_OID           = "2.16.840.1.113883.3.989.2.1.3.2"   # WWID
 FIRST_SENDER_OID   = "2.16.840.1.113883.3.989.2.1.1.3"   # First sender of case (1=Regulator, 2=Other)
 FIRST_SENDER_MAP   = {"1": "Regulator", "2": "Other"}
 
-# Reporter qualification mapping (as in triage)
+# Reporter qualification & source OIDs
+REPORTER_QUAL_OID  = "2.16.840.1.113883.3.989.2.1.1.6"   # 1..5 mapping below
+REPORT_SOURCE_OID  = "2.16.840.1.113883.3.989.2.1.1.22"  # must have displayName="sourceReport"
 REPORTER_MAP = {
     "1": "Physician",
     "2": "Pharmacist",
@@ -31,9 +33,6 @@ REPORTER_MAP = {
     "4": "Lawyer",
     "5": "Consumer or other non-health professional",
 }
-
-# "Report Source" from your snippet
-REPORT_SOURCE_OID = "2.16.840.1.113883.3.989.2.1.1.22"
 
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
 TD_PATHS = [
@@ -107,14 +106,13 @@ def local_name(tag: str) -> str:
     return tag.split('}')[-1] if '}' in tag else tag
 
 def get_text(elem) -> str:
-    return clean_value(elem.text) if (elem is not None and elem.text) else ""
+    return (elem.text or "").strip() if (elem is not None and elem.text) else ""
 
 def read_text_or_mask(elem: Optional[ET.Element]) -> str:
     """Return 'Masked' when nullFlavor='MSK'; else trimmed text; else ''."""
     if elem is None:
         return ""
-    nf = elem.attrib.get('nullFlavor', '')
-    if nf == 'MSK':
+    if elem.attrib.get('nullFlavor') == 'MSK':
         return "Masked"
     return (elem.text or "").strip()
 
@@ -153,13 +151,6 @@ def extract_first_sender_type(root: ET.Element) -> str:
         if local_name(el.tag) == 'code' and el.attrib.get('codeSystem') == FIRST_SENDER_OID:
             raw = (el.attrib.get('code') or "").strip()
             return FIRST_SENDER_MAP.get(raw, raw or "")
-    return ""
-
-def extract_report_source(root: ET.Element) -> str:
-    """From codeSystem=…1.1.22, prefer displayName; else code."""
-    for el in root.iter():
-        if local_name(el.tag) == 'code' and el.attrib.get('codeSystem') == REPORT_SOURCE_OID:
-            return el.attrib.get('displayName') or el.attrib.get('code') or ""
     return ""
 
 def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
@@ -276,8 +267,8 @@ def extract_products(root: ET.Element) -> List[Dict[str, str]]:
             dose_u = dq.attrib.get('unit','') if dq is not None else ''
 
             low = find_first(drug, './/hl7:low'); high = find_first(drug, './/hl7:high')
-            sd_raw = low.attrib.get('value','') if low is not None else ''
-            ed_raw = high.attrib.get('value','') if high is not None else ''
+            sd_raw = (low.attrib.get('value') or '').strip() if low is not None else ''
+            ed_raw = (high.attrib.get('value') or '').strip() if high is not None else ''
 
             form = get_text(find_first(drug, './/hl7:formCode/hl7:originalText'))
             lot = get_text(find_first(drug, './/hl7:lotNumberText'))
@@ -305,34 +296,48 @@ def extract_products(root: ET.Element) -> List[Dict[str, str]]:
             })
     return products
 
-# ---------------- Reporter extraction (robust + mask-aware) ----------------
-def reporter_candidates(root: ET.Element) -> List[ET.Element]:
-    """
-    Likely reporter containers (avoid bare asQualifiedEntity).
-    Prefers author/assignedEntity (your snippet), but supports others.
-    """
+# ---------------- Reporter extraction (STRICT sourceReport filter) ----------------
+def reporter_candidates_all(root: ET.Element) -> List[ET.Element]:
+    """All plausible reporter containers (without filter)."""
     cands: List[ET.Element] = []
-    # Primary: author/assignedEntity
     cands += list(root.findall('.//hl7:author/hl7:assignedEntity', NS))
-    # Also consider assignedAuthor and informant/assignedEntity
     cands += list(root.findall('.//hl7:author/hl7:assignedAuthor', NS))
     cands += list(root.findall('.//hl7:informant/hl7:assignedEntity', NS))
-    # Generic fallbacks
     cands += list(root.findall('.//hl7:assignedAuthor', NS))
     cands += list(root.findall('.//hl7:assignedEntity', NS))
     # participant(AUT/INF)
     for p in root.findall('.//hl7:participant', NS):
         if (p.attrib.get('typeCode') or '').upper() in {'AUT','INF'}:
             cands.append(p)
-    # De-duplicate while preserving order
-    seen = set(); uniq = []
+    # de-dup
+    seen, uniq = set(), []
     for el in cands:
-        key = id(el)
-        if key not in seen:
-            seen.add(key); uniq.append(el)
+        if id(el) not in seen:
+            seen.add(id(el)); uniq.append(el)
     return uniq
 
+def container_has_source_report(node: ET.Element) -> bool:
+    """True iff the container has a descendant code with the report-source OID AND displayName='sourceReport'."""
+    for code_el in node.iter():
+        if local_name(code_el.tag) != 'code':
+            continue
+        if code_el.attrib.get('codeSystem') == REPORT_SOURCE_OID:
+            disp = (code_el.attrib.get('displayName') or '').strip().lower()
+            if disp == 'sourcereport':
+                return True
+    return False
+
+def reporter_candidates_source_report(root: ET.Element) -> List[ET.Element]:
+    """Only those containers that contain the 'sourceReport' codeSystem node."""
+    return [c for c in reporter_candidates_all(root) if container_has_source_report(c)]
+
 def extract_reporter_full(root: ET.Element) -> Dict[str, str]:
+    """
+    Reporter extractor constrained to the container that carries:
+      <code codeSystem="2.16.840.1.113883.3.989.2.1.1.22" displayName="sourceReport"/>
+    Fields extracted only from within that container:
+      Name, Address, Country, Telecoms, Qualification, IDs, Report Source.
+    """
     result = {
         "Report Source": "",
         "Reporter Qualification": "",
@@ -351,130 +356,119 @@ def extract_reporter_full(root: ET.Element) -> Dict[str, str]:
         "Reporter Fax(es)": "",
     }
 
-    cands = reporter_candidates(root)
-    result["Report Source"] = extract_report_source(root)
-
+    cands = reporter_candidates_source_report(root)
     if not cands:
         return result
 
-    def collect_ids(node: ET.Element) -> List[str]:
-        ids = []
-        for id_el in node.findall('.//hl7:id', NS):
-            ext = (id_el.attrib.get('extension') or '').strip()
-            rt  = (id_el.attrib.get('root') or '').strip()
-            if ext and rt: ids.append(f"{ext} ({rt})")
-            elif ext: ids.append(ext)
-            elif rt: ids.append(rt)
-        return list(dict.fromkeys(ids))
+    node = cands[0]  # prefer the first sourceReport container
 
-    def collect_qualification(node: ET.Element) -> str:
-        for code_el in node.iter():
-            if local_name(code_el.tag) == 'code':
-                c = (code_el.attrib.get('code') or '').strip()
-                if c in REPORTER_MAP:
-                    return REPORTER_MAP[c]
-        return ""
-
-    def collect_name(node: ET.Element) -> Tuple[str, List[str], str]:
-        # Prefer assignedPerson/name
-        name_el = node.find('.//hl7:assignedPerson/hl7:name', NS)
-        if name_el is None:
-            name_el = node.find('.//hl7:name', NS)
-        given, family = [], ""
-        if name_el is not None:
-            for g in name_el.findall('hl7:given', NS):
-                val = read_text_or_mask(g)
-                if val: given.append(val)
-            fam_el = name_el.find('hl7:family', NS)
-            family = read_text_or_mask(fam_el)
-        parts = [p for p in given if p] + ([family] if family else [])
-        full = " ".join(parts).strip()
-        if not full and name_el is not None:
-            msks = any((ch.attrib.get('nullFlavor','') == 'MSK') for ch in name_el)
-            full = "Masked" if msks else full
-        return full, given, family
-
-    def collect_org(node: ET.Element) -> str:
-        org_paths = [
-            './/hl7:assignedEntity/hl7:representedOrganization/hl7:name',
-            './/hl7:representedOrganization/hl7:name',
-            './/hl7:scopingOrganization/hl7:name',
-        ]
-        for p in org_paths:
-            el = node.find(p, NS)
-            if el is not None:
-                txt = read_text_or_mask(el)
-                if txt: return txt
-        return ""
-
-    def collect_addr_and_country(node: ET.Element) -> Tuple[str,str,str,str,str]:
-        addr = node.find('.//hl7:addr', NS)
-        street_lines = []
-        city = state = postal = country = ""
-        if addr is not None:
-            for sl in addr.findall('hl7:streetAddressLine', NS):
-                val = read_text_or_mask(sl)
-                if val: street_lines.append(val)
-            city   = read_text_or_mask(addr.find('hl7:city', NS))
-            state  = read_text_or_mask(addr.find('hl7:state', NS))
-            postal = read_text_or_mask(addr.find('hl7:postalCode', NS))
-            country= read_text_or_mask(addr.find('hl7:country', NS))
-        # Fallback via asLocatedEntity/location/code@code (your snippet)
-        if not country:
-            loc = node.find('.//hl7:asLocatedEntity/hl7:location/hl7:code', NS)
-            if loc is not None and loc.attrib.get('code'):
-                country = loc.attrib.get('code').strip()
-        return ", ".join(street_lines), city, state, postal, country
-
-    def collect_telecom(node: ET.Element) -> Tuple[List[str], List[str], List[str]]:
-        phones, emails, faxes = [], [], []
-        for tel in node.findall('.//hl7:telecom', NS):
-            val = (tel.attrib.get('value') or '').strip()
-            use = (tel.attrib.get('use') or '').upper()
-            if not val: continue
-            vlow = val.lower()
-            if vlow.startswith('mailto:'):
-                emails.append(val.split(':',1)[1])
-            elif 'FAX' in use or vlow.startswith('fax:'):
-                faxes.append(val.split(':',1)[-1] if ':' in val else val)
-            elif vlow.startswith('tel:') or vlow.startswith('tel;'):
-                phones.append(val.split(':',1)[1] if ':' in val else val)
-            else:
-                if '@' in val:
-                    emails.append(val.replace('mailto:', ''))
-                elif len(re.sub(r'\D','',val)) >= 7:
-                    phones.append(val)
-                else:
-                    phones.append(val)
-        uniq = lambda L: list(dict.fromkeys([x for x in L if x]))
-        return uniq(phones), uniq(emails), uniq(faxes)
-
-    for node in cands:
-        ids = collect_ids(node)
-        qual = collect_qualification(node)
-        full, given, family = collect_name(node)
-        org = collect_org(node)
-        street, city, state, postal, country = collect_addr_and_country(node)
-        phones, emails, faxes = collect_telecom(node)
-
-        if any([ids, qual, full, org, street, city, state, postal, country, phones, emails, faxes]):
-            result.update({
-                "Reporter Qualification": qual,
-                "Reporter IDs": "; ".join(ids),
-                "Reporter Name (Full)": full,
-                "Reporter Given Name(s)": "; ".join(given) if given else "",
-                "Reporter Family Name": family,
-                "Reporter Organization": org,
-                "Reporter Street": street,
-                "Reporter City/Town": city,
-                "Reporter State/Province": state,
-                "Reporter Postal Code": postal,
-                "Reporter Country": country,
-                "Reporter Phone(s)": "; ".join(phones) if phones else "",
-                "Reporter Email(s)": "; ".join(emails) if emails else "",
-                "Reporter Fax(es)": "; ".join(faxes) if faxes else "",
-            })
+    # Report Source (from the same container)
+    for code_el in node.iter():
+        if local_name(code_el.tag) == 'code' and code_el.attrib.get('codeSystem') == REPORT_SOURCE_OID:
+            result["Report Source"] = code_el.attrib.get('displayName') or code_el.attrib.get('code') or ""
             break
+
+    # Qualification (1..5) under codeSystem 1.1.6 within the same container
+    qual_label = ""
+    for code_el in node.iter():
+        if local_name(code_el.tag) == 'code' and code_el.attrib.get('codeSystem') == REPORTER_QUAL_OID:
+            c = (code_el.attrib.get('code') or '').strip()
+            qual_label = REPORTER_MAP.get(c, c)
+            break
+    result["Reporter Qualification"] = qual_label
+
+    # IDs
+    ids = []
+    for id_el in node.findall('.//hl7:id', NS):
+        ext = (id_el.attrib.get('extension') or '').strip()
+        rt  = (id_el.attrib.get('root') or '').strip()
+        if ext and rt: ids.append(f"{ext} ({rt})")
+        elif ext: ids.append(ext)
+        elif rt: ids.append(rt)
+    if ids:
+        result["Reporter IDs"] = "; ".join(list(dict.fromkeys(ids)))
+
+    # Name (prefer assignedPerson/name)
+    name_el = node.find('.//hl7:assignedPerson/hl7:name', NS) or node.find('.//hl7:name', NS)
+    given_vals, family_val = [], ""
+    if name_el is not None:
+        for g in name_el.findall('hl7:given', NS):
+            v = read_text_or_mask(g)
+            if v: given_vals.append(v)
+        fam_el = name_el.find('hl7:family', NS)
+        family_val = read_text_or_mask(fam_el)
+    parts = [p for p in given_vals if p] + ([family_val] if family_val else [])
+    full_name = " ".join(parts).strip()
+    if not full_name and name_el is not None:
+        if any(ch.attrib.get('nullFlavor') == 'MSK' for ch in name_el):
+            full_name = "Masked"
+    result["Reporter Name (Full)"]   = full_name
+    result["Reporter Given Name(s)"] = "; ".join(given_vals) if given_vals else ""
+    result["Reporter Family Name"]   = family_val
+
+    # Organization (if present)
+    org_paths = [
+        './/hl7:assignedEntity/hl7:representedOrganization/hl7:name',
+        './/hl7:representedOrganization/hl7:name',
+        './/hl7:scopingOrganization/hl7:name',
+    ]
+    org_name = ""
+    for p in org_paths:
+        el = node.find(p, NS)
+        if el is not None:
+            txt = read_text_or_mask(el)
+            if txt:
+                org_name = txt
+                break
+    result["Reporter Organization"] = org_name
+
+    # Address (street, city, state, postal, country)
+    addr = node.find('.//hl7:addr', NS)
+    streets, city, state, postal, country = [], "", "", "", ""
+    if addr is not None:
+        for sl in addr.findall('hl7:streetAddressLine', NS):
+            val = read_text_or_mask(sl)
+            if val: streets.append(val)
+        city   = read_text_or_mask(addr.find('hl7:city', NS))
+        state  = read_text_or_mask(addr.find('hl7:state', NS))
+        postal = read_text_or_mask(addr.find('hl7:postalCode', NS))
+        country= read_text_or_mask(addr.find('hl7:country', NS))
+    # Country fallback: asLocatedEntity/location/code@code
+    if not country:
+        loc = node.find('.//hl7:asLocatedEntity/hl7:location/hl7:code', NS)
+        if loc is not None and loc.attrib.get('code'):
+            country = loc.attrib.get('code').strip()
+
+    result["Reporter Street"]        = ", ".join(streets)
+    result["Reporter City/Town"]     = city
+    result["Reporter State/Province"]= state
+    result["Reporter Postal Code"]   = postal
+    result["Reporter Country"]       = country
+
+    # Telecoms
+    phones, emails, faxes = [], [], []
+    for tel in node.findall('.//hl7:telecom', NS):
+        raw = (tel.attrib.get('value') or '').strip()
+        use = (tel.attrib.get('use') or '').upper()
+        if not raw:
+            continue
+        low = raw.lower()
+        if low.startswith('mailto:'):
+            emails.append(raw.split(':', 1)[1])
+        elif 'FAX' in use or low.startswith('fax:'):
+            faxes.append(raw.split(':', 1)[-1] if ':' in raw else raw)
+        elif low.startswith('tel:') or low.startswith('tel;'):
+            phones.append(raw.split(':', 1)[1] if ':' in raw else raw)
+        else:
+            if '@' in raw:
+                emails.append(raw.replace('mailto:', ''))
+            elif len(re.sub(r'\D', '', raw)) >= 7:
+                phones.append(raw)
+            else:
+                phones.append(raw)
+    if phones: result["Reporter Phone(s)"] = "; ".join(dict.fromkeys(phones))
+    if emails: result["Reporter Email(s)"] = "; ".join(dict.fromkeys(emails))
+    if faxes:  result["Reporter Fax(es)"]  = "; ".join(dict.fromkeys(faxes))
 
     return result
 
@@ -592,7 +586,7 @@ def extract_model(xml_bytes: bytes, debug_events: bool = False) -> Dict[str, Any
     model["WWID"] = extract_wwid(root)
     model["First Sender Type"] = extract_first_sender_type(root)
     model.update(extract_td_frd_lrd(root))
-    # Reporter (robust)
+    # Reporter (STRICT sourceReport container)
     model["Reporter"] = extract_reporter_full(root)
     # Patient / Products / Events / Narrative
     model["Patient"] = extract_patient(root)
@@ -743,12 +737,12 @@ else:
     st.markdown('<div class="box smallnote">No header/admin values present in either file.</div>', unsafe_allow_html=True)
 
 # ---------------- SECTION: Reporter ----------------
-st.subheader("Reporter")
+st.subheader("Reporter (from sourceReport container)")
 rep_df = make_reporter_table(src.get("Reporter",{}), prc.get("Reporter",{}))
 if not rep_df.empty:
     st.table(rep_df)
 else:
-    st.markdown('<div class="box smallnote">No reporter details present in either file.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="box smallnote">No reporter details (sourceReport) present in either file.</div>', unsafe_allow_html=True)
 
 # ---------------- SECTION: Patient Details ----------------
 st.subheader("Patient Details")
