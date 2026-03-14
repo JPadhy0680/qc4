@@ -14,7 +14,9 @@ st.title("🧪📄📄 E2B_R3 Two‑File Comparator — Tabular, Box‑wise")
 NS = {'hl7': 'urn:hl7-org:v3', 'xsi': 'http://www.w3.org/2001/XMLSchema-instance'}
 UNKNOWN_TOKENS = {"unk", "asku", "unknown"}
 SENDER_ID_OID = "2.16.840.1.113883.3.989.2.1.3.1"
-WWID_OID     = "2.16.840.1.113883.3.989.2.1.3.2"  # as per your note
+WWID_OID     = "2.16.840.1.113883.3.989.2.1.3.2"  # your 'WWID'
+FIRST_SENDER_OID = "2.16.840.1.113883.3.989.2.1.1.3"  # First sender of case
+FIRST_SENDER_MAP = {"1": "Regulator", "2": "Other"}
 
 TD_PATHS = [
     './/hl7:transmissionWrapper/hl7:creationTime',
@@ -115,6 +117,17 @@ def extract_sender_id(root: ET.Element) -> str:
 
 def extract_wwid(root: ET.Element) -> str:
     return extract_id_by_oid(root, WWID_OID)
+
+def extract_first_sender_type(root: ET.Element) -> str:
+    """
+    Finds the first <code> with codeSystem = FIRST_SENDER_OID and returns a mapped label.
+    """
+    for el in root.iter():
+        local = el.tag.split('}')[-1] if '}' in el.tag else el.tag
+        if local == 'code' and el.attrib.get('codeSystem') == FIRST_SENDER_OID:
+            raw = (el.attrib.get('code') or "").strip()
+            return FIRST_SENDER_MAP.get(raw, raw or "")
+    return ""
 
 def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
     out = {"TD_raw":"", "TD":"", "FRD_raw":"", "FRD":"", "LRD_raw":"", "LRD":""}
@@ -261,7 +274,7 @@ def extract_products(root: ET.Element) -> List[Dict[str, str]]:
                 "Formulation": clean_value(form),
                 "Lot No": clean_value(lot),
                 "MAH": clean_value(mah),
-                "_key": normalize_text(raw_name) if raw_name else "",  # for matching
+                "_key": normalize_text(raw_name) if raw_name else "",  # matching key
             })
     return products
 
@@ -324,6 +337,7 @@ def extract_model(xml_bytes: bytes) -> Dict[str, Any]:
     model: Dict[str, Any] = {}
     model["Sender ID"] = extract_sender_id(root)
     model["WWID"] = extract_wwid(root)
+    model["First Sender Type"] = extract_first_sender_type(root)
     model.update(extract_td_frd_lrd(root))  # TD/FRD/LRD (raw & formatted)
     model["Patient"] = extract_patient(root)
     model["Products"] = extract_products(root)
@@ -353,24 +367,23 @@ def make_admin_table(src: Dict[str,Any], prc: Dict[str,Any]) -> pd.DataFrame:
     Admin/Header section shows:
       1) Sender ID
       2) WWID
-      3) Day Zero = Source: TD   |   Processed: LRD
+      3) First Sender Type (codeSystem 2.16.840.1.113883.3.989.2.1.1.3 → 1=Regulator, 2=Other)
+      4) Day Zero = Source: TD   |   Processed: LRD
     """
     rows: List[Tuple[str, str, str]] = []
-    # Sender ID
     rows.append(("Sender ID", src.get("Sender ID",""), prc.get("Sender ID","")))
-    # WWID
     rows.append(("WWID", src.get("WWID",""), prc.get("WWID","")))
-    # Day Zero (TD vs LRD)
+    rows.append(("First Sender Type", src.get("First Sender Type",""), prc.get("First Sender Type","")))
     src_td_disp = src.get("TD", "") or format_date(src.get("TD_raw", ""))
     prc_lrd_disp = prc.get("LRD", "") or format_date(prc.get("LRD_raw", ""))
     rows.append(("Day Zero", src_td_disp, prc_lrd_disp))
 
-    # Dates treated as dates only for Day Zero (row index 2)
     df_sender = compare_table([rows[0]], treat_as_dates=False)
     df_wwid   = compare_table([rows[1]], treat_as_dates=False)
-    df_day0   = compare_table([rows[2]], treat_as_dates=True)
+    df_first  = compare_table([rows[2]], treat_as_dates=False)
+    df_day0   = compare_table([rows[3]], treat_as_dates=True)
 
-    parts = [df for df in [df_sender, df_wwid, df_day0] if df is not None and not df.empty]
+    parts = [df for df in [df_sender, df_wwid, df_first, df_day0] if df is not None and not df.empty]
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["Field","Source","Processed"])
 
 def make_patient_table(src: Dict[str,str], prc: Dict[str,str]) -> pd.DataFrame:
@@ -454,7 +467,7 @@ if src.get("_error") or prc.get("_error"):
     st.error(f"Source error: {src.get('_error','-')}\nProcessed error: {prc.get('_error','-')}")
     st.stop()
 
-# ---------------- SECTION: Admin/Header (Sender ID + WWID + Day Zero) ----------------
+# ---------------- SECTION: Admin/Header (Sender ID + WWID + First Sender Type + Day Zero) ----------------
 st.subheader("Admin / Header")
 admin_df = make_admin_table(src, prc)
 if admin_df.empty:
@@ -538,7 +551,7 @@ def rows_from_table(df: pd.DataFrame, section: str) -> List[Dict[str,str]]:
         out.append({"Section": section, "Field": r["Field"], "Source": r["Source"], "Processed": r["Processed"]})
     return out
 
-admin_rows = rows_from_table(admin_df, "Admin/Header")  # includes Sender ID, WWID, Day Zero
+admin_rows = rows_from_table(admin_df, "Admin/Header")  # includes Sender ID, WWID, First Sender Type, Day Zero
 pat_rows = rows_from_table(pat_df, "Patient")
 
 # Drugs sheet
