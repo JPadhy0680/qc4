@@ -33,7 +33,7 @@ REPORTER_MAP = {
     "5": "Consumer or other non-health professional",
 }
 
-# Reporter SOURCE anchor OID
+# Reporter SOURCE anchor OID (to locate reporter branches)
 REPORT_SOURCE_OID  = "2.16.840.1.113883.3.989.2.1.1.22"  # displayName="sourceReport"
 
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
@@ -111,7 +111,6 @@ def get_text(elem) -> str:
     return (elem.text or "").strip() if (elem is not None and elem.text) else ""
 
 def read_text_or_mask(elem: Optional[ET.Element]) -> str:
-    """Return 'Masked' when nullFlavor='MSK'; else trimmed text; else ''."""
     if elem is None:
         return ""
     if elem.attrib.get('nullFlavor') == 'MSK':
@@ -157,7 +156,6 @@ def extract_first_sender_type(root: ET.Element) -> str:
 
 def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
     out = {"TD_raw":"", "TD":"", "FRD_raw":"", "FRD":"", "LRD_raw":"", "LRD":""}
-    # TD
     for p in TD_PATHS:
         e = find_first(root, p)
         if e is not None:
@@ -165,13 +163,11 @@ def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
             if val:
                 out["TD_raw"] = val; out["TD"] = format_date(val)
                 break
-    # LRD
     for el in root.iter():
         if local_name(el.tag) == 'availabilityTime':
             v = el.attrib.get('value')
             if v:
                 out["LRD_raw"] = v; out["LRD"] = format_date(v); break
-    # FRD (earliest low)
     lows = []
     for el in root.iter():
         if local_name(el.tag) == 'low':
@@ -300,18 +296,11 @@ def extract_products(root: ET.Element) -> List[Dict[str, str]]:
             })
     return products
 
-# ---------------- Reporter extraction (STRICT: only branches marked by sourceReport) ----------------
+# ---------------- Reporter extraction (STRICT: only branches with sourceReport; list ALL) ----------------
 def build_parent_map(root: ET.Element) -> Dict[ET.Element, ET.Element]:
     return {c: p for p in root.iter() for c in list(p)}
 
 def find_all_source_report_containers(root: ET.Element) -> List[ET.Element]:
-    """
-    Find ALL reporter containers that belong to branches containing:
-      <code codeSystem=REPORT_SOURCE_OID displayName='sourceReport'/>
-    We anchor on the <code>, walk up to a logical ancestor (relatedInvestigation / subjectOf2 / controlActEvent),
-    then search down for reporter containers (author/assignedEntity|assignedAuthor, informant/assignedEntity).
-    """
-    # 1) all <code> nodes that are sourceReport
     code_nodes: List[ET.Element] = []
     for el in root.iter():
         if local_name(el.tag) == 'code' and el.attrib.get('codeSystem') == REPORT_SOURCE_OID:
@@ -343,8 +332,8 @@ def find_all_source_report_containers(root: ET.Element) -> List[ET.Element]:
                     cand = anc.find(xp, NS)
                     if cand is not None:
                         containers.append(cand)
-                break  # stop at the first logical ancestor
-    # de-dup by element identity
+                break
+    # de-dup by identity & preserve order
     seen, uniq = set(), []
     for el in containers:
         if id(el) not in seen:
@@ -352,9 +341,6 @@ def find_all_source_report_containers(root: ET.Element) -> List[ET.Element]:
     return uniq
 
 def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
-    """
-    Extract one reporter record from a given container node.
-    """
     result = {
         "Reporter Qualification": "",
         "Reporter IDs": "",
@@ -371,7 +357,6 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
         "Reporter Email(s)": "",
         "Reporter Fax(es)": "",
     }
-
     # IDs
     ids = []
     for id_el in node.findall('.//hl7:id', NS):
@@ -382,17 +367,14 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
         elif rt: ids.append(rt)
     if ids:
         result["Reporter IDs"] = "; ".join(dict.fromkeys(ids))
-
-    # Qualification (1..5) under codeSystem 1.1.6
+    # Qualification
     qual = ""
     for code_el in node.iter():
         if local_name(code_el.tag) == 'code' and code_el.attrib.get('codeSystem') == REPORTER_QUAL_OID:
             c = (code_el.attrib.get('code') or '').strip()
-            qual = REPORTER_MAP.get(c, c)
-            break
+            qual = REPORTER_MAP.get(c, c); break
     result["Reporter Qualification"] = qual
-
-    # Name (prefer assignedPerson/name)
+    # Name
     name_el = node.find('.//hl7:assignedPerson/hl7:name', NS) or node.find('.//hl7:name', NS)
     given_vals, family_val = [], ""
     if name_el is not None:
@@ -408,7 +390,6 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
     result["Reporter Name (Full)"]   = full_name
     result["Reporter Given Name(s)"] = "; ".join(given_vals) if given_vals else ""
     result["Reporter Family Name"]   = family_val
-
     # Organization
     for xp in [
         './/hl7:assignedEntity/hl7:representedOrganization/hl7:name',
@@ -421,8 +402,7 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
             if txt:
                 result["Reporter Organization"] = txt
                 break
-
-    # Address (+country)
+    # Address
     addr = node.find('.//hl7:addr', NS)
     streets, city, state, postal, country = [], "", "", "", ""
     if addr is not None:
@@ -437,13 +417,11 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
         loc = node.find('.//hl7:asLocatedEntity/hl7:location/hl7:code', NS)
         if loc is not None and loc.attrib.get('code'):
             country = loc.attrib.get('code').strip()
-
     result["Reporter Street"]         = ", ".join(streets)
     result["Reporter City/Town"]      = city
     result["Reporter State/Province"] = state
     result["Reporter Postal Code"]    = postal
     result["Reporter Country"]        = country
-
     # Telecoms
     phones, emails, faxes = [], [], []
     for tel in node.findall('.//hl7:telecom', NS):
@@ -467,36 +445,15 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
     if phones: result["Reporter Phone(s)"] = "; ".join(dict.fromkeys(phones))
     if emails: result["Reporter Email(s)"] = "; ".join(dict.fromkeys(emails))
     if faxes:  result["Reporter Fax(es)"]  = "; ".join(dict.fromkeys(faxes))
-
     return result
 
-def make_reporter_key(rep: Dict[str, str]) -> str:
-    """
-    Stable key to match source vs processed reporters:
-     - Prefer Reporter IDs; else composite of Name + Qualification + Country + Organization.
-    """
-    ids = (rep.get("Reporter IDs") or "").lower().strip()
-    if ids:
-        return normalize_text(ids)
-    composite = "|".join([
-        rep.get("Reporter Name (Full)", ""),
-        rep.get("Reporter Qualification", ""),
-        rep.get("Reporter Country", ""),
-        rep.get("Reporter Organization", "")
-    ]).lower()
-    return normalize_text(composite) or "unknown"
-
 def extract_reporters_from_sourceReport(root: ET.Element) -> List[Dict[str, str]]:
-    """
-    Return ALL reporters that sit under branches marked with sourceReport.
-    """
     containers = find_all_source_report_containers(root)
     reporters: List[Dict[str, str]] = []
     for node in containers:
         rep = extract_reporter_from_container(node)
-        if any(clean_value(v) for v in rep.values()):  # keep non-empty
-            rep["_key"] = make_reporter_key(rep)
-            reporters.append(rep)
+        if any(clean_value(v) for v in rep.values()):
+            reporters.append(rep)  # sequential; no matching here
     return reporters
 
 # ---------------- Events extraction (robust + debug) ----------------
@@ -584,14 +541,11 @@ def extract_model(xml_bytes: bytes, debug_events: bool = False) -> Dict[str, Any
     except Exception as e:
         return {"_error": f"XML parse error: {e}"}
     model: Dict[str, Any] = {}
-    # Admin
     model["Sender ID"] = extract_sender_id(root)
     model["WWID"] = extract_wwid(root)
     model["First Sender Type"] = extract_first_sender_type(root)
     model.update(extract_td_frd_lrd(root))
-    # Reporters (ONLY those under branches with sourceReport marker; ALL of them)
-    model["Reporters"] = extract_reporters_from_sourceReport(root)
-    # Patient / Products / Events / Narrative
+    model["Reporters"] = extract_reporters_from_sourceReport(root)   # ONLY sourceReport branches, ALL reporters
     model["Patient"] = extract_patient(root)
     model["Products"] = extract_products(root)
     model["Events"] = extract_events(root, debug=debug_events)
@@ -626,7 +580,7 @@ def make_admin_table(src: Dict[str,Any], prc: Dict[str,Any]) -> pd.DataFrame:
     parts = [df for df in parts if not df.empty]
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["Field","Source","Processed"])
 
-def make_reporter_table_one(src: Dict[str,str], prc: Dict[str,str]) -> pd.DataFrame:
+def make_reporter_table_one_side(rep: Dict[str,str]) -> pd.DataFrame:
     fields = [
         "Reporter Qualification",
         "Reporter IDs",
@@ -643,8 +597,13 @@ def make_reporter_table_one(src: Dict[str,str], prc: Dict[str,str]) -> pd.DataFr
         "Reporter Email(s)",
         "Reporter Fax(es)",
     ]
-    rows = [(f, src.get(f,""), prc.get(f,"")) for f in fields]
-    return compare_table(rows, treat_as_dates=False)
+    rows = [(f, rep.get(f,"")) for f in fields]
+    # render as single-column table for one side
+    disp = []
+    for field, val in rows:
+        if has_value(val):
+            disp.append({"Field": field, "Value": val})
+    return pd.DataFrame(disp) if disp else pd.DataFrame(columns=["Field","Value"])
 
 def make_patient_table(src_pat: Dict[str,str], prc_pat: Dict[str,str]) -> pd.DataFrame:
     fields = ["Gender","Age","Age Group","Height","Weight","Initials"]
@@ -652,7 +611,7 @@ def make_patient_table(src_pat: Dict[str,str], prc_pat: Dict[str,str]) -> pd.Dat
     return compare_table(rows, treat_as_dates=False)
 
 def dict_by_key(items: List[Dict[str,Any]]) -> Dict[str, Dict[str,Any]]:
-    return {it.get("_key",""): it for it in items if it.get("_key","")}
+    return {str(i): it for i, it in enumerate(items, start=1)}  # index order map
 
 # --------------- UI: Upload & Parse ----------------
 st.markdown("### 📤 Upload the two XML files you want to compare (no ID pairing; exact files compared)")
@@ -686,44 +645,41 @@ if not admin_df.empty:
 else:
     st.markdown('<div class="box smallnote">No header/admin values present in either file.</div>', unsafe_allow_html=True)
 
-# ---------------- SECTION: Reporters (ONLY from sourceReport branches; ALL of them) ----------------
-st.subheader("Reporters (from sourceReport branches)")
+# ---------------- SECTION: Reporters (sequential; no matching) ----------------
+st.subheader("Reporters (sequential listing)")
+
 src_reps = src.get("Reporters", []) or []
 prc_reps = prc.get("Reporters", []) or []
-src_rep_idx = dict_by_key(src_reps)
-prc_rep_idx = dict_by_key(prc_reps)
 
-# ensure keys unique even if duplicates (e.g., all Masked)
-def _uniquify_keys(idx: Dict[str,Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
-    out = {}
-    seen = {}
-    for k, v in idx.items():
-        base = k or "unknown"
-        n = seen.get(base, 0) + 1
-        seen[base] = n
-        key = base if n == 1 else f"{base}#{n}"
-        out[key] = v
-    return out
+colL, colR = st.columns(2)
 
-src_rep_idx = _uniquify_keys(src_rep_idx)
-prc_rep_idx = _uniquify_keys(prc_rep_idx)
+with colL:
+    st.markdown("**Source**")
+    if not src_reps:
+        st.markdown('<div class="box smallnote">No reporters found in Source.</div>', unsafe_allow_html=True)
+    else:
+        for i, rep in enumerate(src_reps, start=1):
+            st.markdown(f'<div class="box"><h5>Reporter {i}</h5>', unsafe_allow_html=True)
+            df_side = make_reporter_table_one_side(rep)
+            if df_side.empty:
+                st.markdown('<div class="smallnote">No values present for this reporter.</div>', unsafe_allow_html=True)
+            else:
+                st.table(df_side)
+            st.markdown('</div>', unsafe_allow_html=True)
 
-all_rep_keys = sorted(set(src_rep_idx) | set(prc_rep_idx))
-if not all_rep_keys:
-    st.markdown('<div class="box smallnote">No reporters (sourceReport) present in either file.</div>', unsafe_allow_html=True)
-else:
-    for i, key in enumerate(all_rep_keys, start=1):
-        srec = src_rep_idx.get(key, {})
-        prec = prc_rep_idx.get(key, {})
-        title = srec.get("Reporter Name (Full)") or prec.get("Reporter Name (Full)") or \
-                srec.get("Reporter Organization") or prec.get("Reporter Organization") or f"Reporter {i}"
-        st.markdown(f'<div class="box"><h5>{title}</h5>', unsafe_allow_html=True)
-        r_df = make_reporter_table_one(srec, prec)
-        if r_df.empty:
-            st.markdown('<div class="smallnote">No values to display for this reporter in either file.</div>', unsafe_allow_html=True)
-        else:
-            st.table(r_df)
-        st.markdown('</div>', unsafe_allow_html=True)
+with colR:
+    st.markdown("**Processed**")
+    if not prc_reps:
+        st.markdown('<div class="box smallnote">No reporters found in Processed.</div>', unsafe_allow_html=True)
+    else:
+        for i, rep in enumerate(prc_reps, start=1):
+            st.markdown(f'<div class="box"><h5>Reporter {i}</h5>', unsafe_allow_html=True)
+            df_side = make_reporter_table_one_side(rep)
+            if df_side.empty:
+                st.markdown('<div class="smallnote">No values present for this reporter.</div>', unsafe_allow_html=True)
+            else:
+                st.table(df_side)
+            st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------------- SECTION: Patient Details ----------------
 st.subheader("Patient Details")
@@ -737,8 +693,8 @@ else:
 st.subheader("Drug Details (suspects) — matched by drug name")
 src_prods = src.get("Products", [])
 prc_prods = prc.get("Products", [])
-src_idx = dict_by_key(src_prods)
-prc_idx = dict_by_key(prc_prods)
+src_idx = { (it.get("_key") or f"src#{i}"): it for i, it in enumerate(src_prods, 1) }
+prc_idx = { (it.get("_key") or f"prc#{i}"): it for i, it in enumerate(prc_prods, 1) }
 all_drug_keys = sorted(set(src_idx) | set(prc_idx))
 
 def make_product_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
@@ -839,26 +795,27 @@ else:
 st.markdown("---")
 st.markdown("### ⬇️ Download Comparison (Excel)")
 
+def rows_from_table_single(df: pd.DataFrame, section: str, side: str, group: str) -> List[Dict[str,str]]:
+    if df is None or df.empty: return []
+    return [{"Section": section, "Side": side, "Group": group, "Field": r["Field"], "Value": r["Value"]} for _, r in df.iterrows()]
+
 def rows_from_table(df: pd.DataFrame, section: str, group: str = "") -> List[Dict[str,str]]:
     if df is None or df.empty: return []
     return [{"Section": section, "Group": group, "Field": r["Field"], "Source": r["Source"], "Processed": r["Processed"]} for _, r in df.iterrows()]
 
-admin_rows = rows_from_table(admin_df, "Admin/Header")
+admin_df_rows = rows_from_table(admin_df, "Admin/Header")
+pat_df_rows = rows_from_table(pat_df, "Patient")
 
-# Reporter rows (multiple)
+# Reporters sheet (sequential; two sides)
 reporter_rows: List[Dict[str,str]] = []
-for i, key in enumerate(all_rep_keys, start=1):
-    srec = src_rep_idx.get(key, {})
-    prec = prc_rep_idx.get(key, {})
-    title = srec.get("Reporter Name (Full)") or prec.get("Reporter Name (Full)") or \
-            srec.get("Reporter Organization") or prec.get("Reporter Organization") or f"Reporter {i}"
-    df_r = make_reporter_table_one(srec, prec)
-    reporter_rows += rows_from_table(df_r, "Reporter", group=title)
+for i, rep in enumerate(src_reps, start=1):
+    df_side = make_reporter_table_one_side(rep)
+    reporter_rows += rows_from_table_single(df_side, "Reporter", "Source", f"Reporter {i}")
+for i, rep in enumerate(prc_reps, start=1):
+    df_side = make_reporter_table_one_side(rep)
+    reporter_rows += rows_from_table_single(df_side, "Reporter", "Processed", f"Reporter {i}")
 
-# Patient rows
-patient_rows = rows_from_table(pat_df, "Patient")
-
-# Drugs sheet
+# Drugs sheet (flatten)
 drug_rows = []
 for key in all_drug_keys:
     srec = src_idx.get(key, {})
@@ -870,7 +827,7 @@ for key in all_drug_keys:
         if has_value(s_val) or has_value(p_val):
             drug_rows.append({"Section":"Drug", "Group": title, "Field": field, "Source": s_val or "—", "Processed": p_val or "—"})
 
-# Events sheet
+# Events sheet (flatten)
 event_rows = []
 for key in all_evt_keys:
     se = src_evt_idx.get(key, {})
@@ -884,18 +841,15 @@ for key in all_evt_keys:
 
 def build_excel_bytes() -> Optional[bytes]:
     sheets: Dict[str, pd.DataFrame] = {}
-    sheets["Admin_Patient"] = pd.DataFrame(admin_rows + patient_rows)
+    sheets["Admin_Patient"] = pd.DataFrame(admin_df_rows + pat_df_rows)
     if reporter_rows: sheets["Reporters"] = pd.DataFrame(reporter_rows)
     if drug_rows:     sheets["Drugs"] = pd.DataFrame(drug_rows)
     if event_rows:    sheets["Events"] = pd.DataFrame(event_rows)
-    # Narrative, if any
-    # (kept simple — one row with both narratives)
     if has_value(src.get("Narrative","")) or has_value(prc.get("Narrative","")):
         sheets["Narrative"] = pd.DataFrame([{
             "Source Narrative": src.get("Narrative","") or "—",
             "Processed Narrative": prc.get("Narrative","") or "—"
         }])
-
     excel_buffer = io.BytesIO()
     for engine in ("openpyxl", "xlsxwriter"):
         try:
