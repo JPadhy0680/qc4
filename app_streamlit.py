@@ -36,6 +36,9 @@ REPORTER_MAP = {
 # Reporter SOURCE anchor OID (to locate reporter branches)
 REPORT_SOURCE_OID  = "2.16.840.1.113883.3.989.2.1.1.22"  # displayName="sourceReport"
 
+# Patient: Age observation OID
+AGE_OID            = "2.16.840.1.113883.3.989.2.1.1.19"  # 'age' observation system
+
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
 TD_PATHS = [
     './/hl7:transmissionWrapper/hl7:creationTime',
@@ -136,6 +139,36 @@ def has_value(x: str) -> bool:
 def safe_disp(v: str) -> str:
     return v if v else "—"
 
+# ---- Generic patient observation resolver (displayName OR OID) ----
+def get_pq_value_by_code(
+    root: ET.Element,
+    display_name: Optional[str] = None,
+    code_system_oid: Optional[str] = None
+) -> Tuple[str, str]:
+    """
+    Find an <observation> whose <code> matches either displayName or codeSystem OID
+    and return (value, unit) from its child <value xsi:type="PQ" ...>.
+    Returns ("","") if not found.
+    """
+    for obs in root.findall('.//hl7:observation', NS):
+        code_el = obs.find('hl7:code', NS)
+        if code_el is None:
+            continue
+        ok = False
+        if display_name and (code_el.attrib.get('displayName') or '').strip().lower() == display_name.lower():
+            ok = True
+        if (not ok) and code_system_oid and (code_el.attrib.get('codeSystem') == code_system_oid):
+            ok = True
+        if not ok:
+            continue
+        val_el = obs.find('hl7:value', NS)
+        if val_el is None:
+            continue
+        v = (val_el.attrib.get('value') or '').strip()
+        u = (val_el.attrib.get('unit') or '').strip()
+        return v, u
+    return "", ""
+
 # ---------------- Admin extraction ----------------
 def extract_id_by_oid(root: ET.Element, oid: str) -> str:
     e = find_first(root, f'.//hl7:id[@root="{oid}"]')
@@ -156,6 +189,7 @@ def extract_first_sender_type(root: ET.Element) -> str:
 
 def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
     out = {"TD_raw":"", "TD":"", "FRD_raw":"", "FRD":"", "LRD_raw":"", "LRD":""}
+    # TD
     for p in TD_PATHS:
         e = find_first(root, p)
         if e is not None:
@@ -163,11 +197,13 @@ def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
             if val:
                 out["TD_raw"] = val; out["TD"] = format_date(val)
                 break
+    # LRD
     for el in root.iter():
         if local_name(el.tag) == 'availabilityTime':
             v = el.attrib.get('value')
             if v:
                 out["LRD_raw"] = v; out["LRD"] = format_date(v); break
+    # FRD (earliest low)
     lows = []
     for el in root.iter():
         if local_name(el.tag) == 'low':
@@ -180,18 +216,28 @@ def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
             out["FRD_raw"] = pairs[0][1]; out["FRD"] = format_date(pairs[0][1])
     return out
 
-# ---------------- Patient extraction ----------------
+# ---------------- Patient extraction (patched) ----------------
 def extract_patient(root: ET.Element) -> Dict[str, str]:
+    # Gender
     gender_elem = find_first(root, './/hl7:administrativeGenderCode')
     gender_code = gender_elem.attrib.get('code', '') if gender_elem is not None else ''
     gender = clean_value(map_gender(gender_code))
 
-    age_elem = find_first(root, './/hl7:code[@displayName="age"]/../hl7:value')
-    age_val = age_elem.attrib.get('value','') if age_elem is not None else ''
-    age_unit_raw = age_elem.attrib.get('unit','') if age_elem is not None else ''
-    unit = {'a':'year', 'b':'month'}.get(str(age_unit_raw).lower(), age_unit_raw)
-    age = f"{clean_value(age_val)}{(' ' + clean_value(unit)) if clean_value(age_val) and clean_value(unit) else ''}".strip()
+    # Age: support displayName OR OID (AGE_OID)
+    age_val, age_unit_raw = get_pq_value_by_code(
+        root,
+        display_name="age",
+        code_system_oid=AGE_OID
+    )
+    unit_map = {'a': 'year', 'b': 'month'}
+    age_unit_label = unit_map.get((age_unit_raw or '').lower(), age_unit_raw or '')
+    age = ""
+    if clean_value(age_val):
+        age = clean_value(age_val)
+        if clean_value(age_unit_label):
+            age = f"{age} {age_unit_label}"
 
+    # Age Group (kept as before; if you share its OID, we can add the same dual lookup)
     age_group_map = {"0":"Foetus","1":"Neonate","2":"Infant","3":"Child","4":"Adolescent","5":"Adult","6":"Elderly"}
     ag_elem = find_first(root, './/hl7:code[@displayName="ageGroup"]/../hl7:value')
     age_group = ""
@@ -200,19 +246,48 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
         nf = ag_elem.attrib.get('nullFlavor','')
         age_group = age_group_map.get(c, "[Masked/Unknown]" if (c in ["MSK","UNK","ASKU","NI"] or nf in ["MSK","UNK","ASKU","NI"]) else "")
 
-    weight_elem = find_first(root, './/hl7:code[@displayName="bodyWeight"]/../hl7:value')
+    # Weight: prefer displayName path; fallback by typical units if missing
+    w_el = find_first(root, './/hl7:code[@displayName="bodyWeight"]/../hl7:value')
+    w_val = w_el.attrib.get('value','') if w_el is not None else ''
+    w_unit = w_el.attrib.get('unit','') if w_el is not None else ''
+    if not (w_val or w_unit):
+        # heuristic fallback (if partner omitted displayName and OID is unknown)
+        for obs in root.findall('.//hl7:observation', NS):
+            val = obs.find('hl7:value', NS)
+            if val is None: 
+                continue
+            u = (val.attrib.get('unit') or '').strip().lower()
+            if u in {'kg','lb','lbs'}:
+                w_val = (val.attrib.get('value') or '').strip()
+                w_unit = (val.attrib.get('unit') or '').strip()
+                if w_val:
+                    break
     weight = ""
-    if weight_elem is not None:
-        wv = clean_value(weight_elem.attrib.get('value',''))
-        wu = clean_value(weight_elem.attrib.get('unit',''))
-        weight = f"{wv}{(' ' + wu) if wv and wu else ''}"
+    if clean_value(w_val):
+        weight = clean_value(w_val)
+        if clean_value(w_unit):
+            weight = f"{weight} {w_unit}"
 
-    height_elem = find_first(root, './/hl7:code[@displayName="height"]/../hl7:value')
+    # Height: prefer displayName; fallback by typical units if missing
+    h_el = find_first(root, './/hl7:code[@displayName="height"]/../hl7:value')
+    h_val = h_el.attrib.get('value','') if h_el is not None else ''
+    h_unit = h_el.attrib.get('unit','') if h_el is not None else ''
+    if not (h_val or h_unit):
+        for obs in root.findall('.//hl7:observation', NS):
+            val = obs.find('hl7:value', NS)
+            if val is None: 
+                continue
+            u = (val.attrib.get('unit') or '').strip().lower()
+            if u in {'cm','m','in'}:
+                h_val = (val.attrib.get('value') or '').strip()
+                h_unit = (val.attrib.get('unit') or '').strip()
+                if h_val:
+                    break
     height = ""
-    if height_elem is not None:
-        hv = clean_value(height_elem.attrib.get('value',''))
-        hu = clean_value(height_elem.attrib.get('unit',''))
-        height = f"{hv}{(' ' + hu) if hv and hu else ''}"
+    if clean_value(h_val):
+        height = clean_value(h_val)
+        if clean_value(h_unit):
+            height = f"{height} {h_unit}"
 
     # Initials (mask-aware)
     initials = ""
@@ -226,10 +301,15 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
                 if g.text and g.text.strip(): parts.append(g.text.strip()[0].upper())
             fam = nm.find('hl7:family', NS)
             if fam is not None and fam.text and fam.text.strip(): parts.append(fam.text.strip()[0].upper())
-            initials = "".join(parts) or get_text(nm)
+            initials = "".join(parts) or clean_value(get_text(nm))
+
     return {
-        "Gender": clean_value(gender), "Age": clean_value(age), "Age Group": clean_value(age_group),
-        "Height": clean_value(height), "Weight": clean_value(weight), "Initials": clean_value(initials),
+        "Gender": clean_value(gender),
+        "Age": clean_value(age),
+        "Age Group": clean_value(age_group),
+        "Height": clean_value(height),
+        "Weight": clean_value(weight),
+        "Initials": clean_value(initials),
     }
 
 # ---------------- Products extraction ----------------
@@ -296,7 +376,7 @@ def extract_products(root: ET.Element) -> List[Dict[str, str]]:
             })
     return products
 
-# ---------------- Reporter extraction (STRICT: only branches with sourceReport; list ALL) ----------------
+# ---------------- Reporter extraction (STRICT: only branches with sourceReport; list ALL; pair sequentially) ----------------
 def build_parent_map(root: ET.Element) -> Dict[ET.Element, ET.Element]:
     return {c: p for p in root.iter() for c in list(p)}
 
@@ -637,7 +717,7 @@ if not admin_df.empty:
 else:
     st.markdown('<div class="box smallnote">No header/admin values present in either file.</div>', unsafe_allow_html=True)
 
-# ---------------- SECTION: Reporters (paired by index; Field | Source | Processed) ----------------
+# ---------------- SECTION: Reporters (paired sequentially) ----------------
 st.subheader("Reporters (paired sequentially)")
 src_reps = src.get("Reporters", []) or []
 prc_reps = prc.get("Reporters", []) or []
@@ -667,10 +747,11 @@ else:
 
 # ---------------- SECTION: Drug Details (matched by drug name) ----------------
 st.subheader("Drug Details (suspects) — matched by drug name")
-src_prods = src.get("Products", [])
-prc_prods = prc.get("Products", [])
 def dict_by_key(items: List[Dict[str,Any]]) -> Dict[str, Dict[str,Any]]:
     return {it.get("_key",""): it for it in items if it.get("_key","")}
+
+src_prods = src.get("Products", [])
+prc_prods = prc.get("Products", [])
 src_idx = dict_by_key(src_prods)
 prc_idx = dict_by_key(prc_prods)
 all_drug_keys = sorted(set(src_idx) | set(prc_idx))
