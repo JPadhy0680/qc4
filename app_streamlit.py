@@ -1547,7 +1547,7 @@ st.subheader("Causality")
 def _caus_df(lst: List[Dict[str,Any]]) -> pd.DataFrame:
     # Only the requested columns; Intervention/EventRef/ProductRef omitted
     if not lst:
-        return pd.DataFrame(columns=["Assessor","Assessment","Method","Reaction","Drug"])
+        return pd.DataFrame(columns=["Drug","Reaction","Assessor","Method","Assessment"])
     rows = []
     for r in lst:
         rows.append({
