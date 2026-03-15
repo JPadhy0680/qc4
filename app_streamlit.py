@@ -56,8 +56,8 @@ ACTION_TAKEN_MAP = {
 
 # MedDRA / Clinical section OIDs
 MEDDRA_LLT_OID = "2.16.840.1.113883.6.163"               # LLT codes in observations
-MH_SECTION_OID = "2.16.840.1.113883.3.989.2.1.1.20"      # clinical sections
-STATUS_OID     = "2.16.840.1.113883.3.989.2.1.1.19"      # status & various flags (e.g., continuing, moreInformationAvailable)
+MH_SECTION_OID = "2.16.840.1.113883.3.989.2.1.1.20"      # clinical sections (MH, Labs, etc.)
+STATUS_OID     = "2.16.840.1.113883.3.989.2.1.1.19"      # status & various flags; also carries "causality" (code 39)
 
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
 TD_PATHS = [
@@ -164,8 +164,7 @@ def safe_disp(v: str) -> str:
 def _col_letters_to_index(col_letters: str) -> int:
     res = 0
     for ch in col_letters:
-        if not ch.isalpha():
-            break
+        if not ch.isalpha(): break
         res = res * 26 + (ord(ch.upper()) - ord('A') + 1)
     return res - 1
 
@@ -179,7 +178,7 @@ def _parse_sheet_xml(sheet_xml_bytes: bytes, shared_strings: List[str]) -> pd.Da
 
     for row in root.findall('.//a:sheetData/a:row', ns):
         values: Dict[int, str] = {}
-        for c in row.findAll('a:c', ns) if hasattr(row, 'findAll') else row.findall('a:c', ns):
+        for c in row.findall('a:c', ns):
             r = c.attrib.get('r', '')
             col_letters = ''.join([ch for ch in r if ch.isalpha()]) or 'A'
             col_idx = _col_letters_to_index(col_letters)
@@ -218,7 +217,7 @@ def _parse_sheet_xml(sheet_xml_bytes: bytes, shared_strings: List[str]) -> pd.Da
     return pd.DataFrame(data, columns=header)
 
 def _read_xlsx_no_openpyxl(uploaded_file) -> pd.DataFrame:
-    data = uploaded_file.read()  # bytes
+    data = uploaded_file.read()
     zf = zipfile.ZipFile(io.BytesIO(data))
 
     shared_strings: List[str] = []
@@ -327,7 +326,54 @@ def read_numeric_with_unit(value_node: Optional[ET.Element]) -> str:
 
     return get_text(value_node)
 
-# ---- Patient PQ resolver ----
+# ---------------- Admin extraction ----------------
+def extract_id_by_oid(root: ET.Element, oid: str) -> str:
+    e = find_first(root, f'.//hl7:id[@root="{oid}"]')
+    return clean_value(e.attrib.get('extension', '')) if e is not None else ""
+
+def extract_sender_id(root: ET.Element) -> str:
+    return extract_id_by_oid(root, SENDER_ID_OID)
+
+def extract_wwid(root: ET.Element) -> str:
+    return extract_id_by_oid(root, WWID_OID)
+
+def extract_first_sender_type(root: ET.Element) -> str:
+    for el in root.iter():
+        if local_name(el.tag) == 'code' and el.attrib.get('codeSystem') == FIRST_SENDER_OID:
+            raw = (el.attrib.get('code') or "").strip()
+            return FIRST_SENDER_MAP.get(raw, raw or "")
+    return ""
+
+def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
+    out = {"TD_raw":"", "TD":"", "FRD_raw":"", "FRD":"", "LRD_raw":"", "LRD":""}
+    # TD
+    for p in TD_PATHS:
+        e = find_first(root, p)
+        if e is not None:
+            val = e.attrib.get('value') or get_text(e)
+            if val:
+                out["TD_raw"] = val; out["TD"] = format_date(val)
+                break
+    # LRD
+    for el in root.iter():
+        if local_name(el.tag) == 'availabilityTime':
+            v = el.attrib.get('value')
+            if v:
+                out["LRD_raw"] = v; out["LRD"] = format_date(v); break
+    # FRD (earliest <low>)
+    lows = []
+    for el in root.iter():
+        if local_name(el.tag) == 'low':
+            v = el.attrib.get('value')
+            if v: lows.append(v)
+    if lows:
+        pairs = [(parse_date_obj(v), v) for v in lows if parse_date_obj(v)]
+        if pairs:
+            pairs.sort(key=lambda t: t[0])
+            out["FRD_raw"] = pairs[0][1]; out["FRD"] = format_date(pairs[0][1])
+    return out
+
+# ---------------- Patient extraction ----------------
 def get_pq_value_by_code(root: ET.Element, display_name: Optional[str] = None, code_system_oid: Optional[str] = None) -> Tuple[str, str]:
     for obs in root.findall('.//hl7:observation', NS):
         code_el = obs.find('hl7:code', NS)
@@ -359,66 +405,13 @@ def find_mask_aware_id_by_root(root: ET.Element, oid: str) -> str:
             return ext
     return ""
 
-# ---------------- Admin extraction ----------------
-def extract_id_by_oid(root: ET.Element, oid: str) -> str:
-    e = find_first(root, f'.//hl7:id[@root="{oid}"]')
-    return clean_value(e.attrib.get('extension', '')) if e is not None else ""
-
-def extract_sender_id(root: ET.Element) -> str:
-    return extract_id_by_oid(root, SENDER_ID_OID)
-
-def extract_wwid(root: ET.Element) -> str:
-    return extract_id_by_oid(root, WWID_OID)
-
-def extract_first_sender_type(root: ET.Element) -> str:
-    for el in root.iter():
-        if local_name(el.tag) == 'code' and el.attrib.get('codeSystem') == FIRST_SENDER_OID:
-            raw = (el.attrib.get('code') or "").strip()
-            return FIRST_SENDER_MAP.get(raw, raw or "")
-    return ""
-
-def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
-    out = {"TD_raw":"", "TD":"", "FRD_raw":"", "FRD":"", "LRD_raw":"", "LRD":""}
-    # TD
-    for p in TD_PATHS:
-        e = find_first(root, p)
-        if e is not None:
-            val = e.attrib.get('value') or get_text(e)
-            if val:
-                out["TD_raw"] = val
-                out["TD"] = format_date(val)
-                break
-    # LRD
-    for el in root.iter():
-        if local_name(el.tag) == 'availabilityTime':
-            v = el.attrib.get('value')
-            if v:
-                out["LRD_raw"] = v
-                out["LRD"] = format_date(v)
-                break
-    # FRD (earliest <low>)
-    lows = []
-    for el in root.iter():
-        if local_name(el.tag) == 'low':
-            v = el.attrib.get('value')
-            if v:
-                lows.append(v)
-    if lows:
-        pairs = [(parse_date_obj(v), v) for v in lows if parse_date_obj(v)]
-        if pairs:
-            pairs.sort(key=lambda t: t[0])
-            out["FRD_raw"] = pairs[0][1]
-            out["FRD"] = format_date(pairs[0][1])
-    return out
-
-# ---------------- Patient extraction ----------------
 def extract_patient(root: ET.Element) -> Dict[str, str]:
     # Gender
     gender_elem = find_first(root, './/hl7:administrativeGenderCode')
     gender_code = gender_elem.attrib.get('code', '') if gender_elem is not None else ''
     gender = clean_value(map_gender(gender_code))
 
-    # Age: displayName OR OID
+    # Age
     age_val, age_unit_raw = get_pq_value_by_code(root, display_name="age", code_system_oid=AGE_OID)
     unit_map = {'a': 'year', 'b': 'month'}
     age_unit_label = unit_map.get((age_unit_raw or '').lower(), age_unit_raw or '')
@@ -444,7 +437,7 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
     if not (w_val or w_unit):
         for obs in root.findall('.//hl7:observation', NS):
             val = obs.find('hl7:value', NS)
-            if val is None:
+            if val is None: 
                 continue
             u = (val.attrib.get('unit') or '').strip().lower()
             if u in {'kg','lb','lbs'}:
@@ -465,7 +458,7 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
     if not (h_val or h_unit):
         for obs in root.findall('.//hl7:observation', NS):
             val = obs.find('hl7:value', NS)
-            if val is None:
+            if val is None: 
                 continue
             u = (val.attrib.get('unit') or '').strip().lower()
             if u in {'cm','m','in'}:
@@ -488,11 +481,9 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
         else:
             parts = []
             for g in nm.findall('hl7:given', NS):
-                if g.text and g.text.strip():
-                    parts.append(g.text.strip()[0].upper())
+                if g.text and g.text.strip(): parts.append(g.text.strip()[0].upper())
             fam = nm.find('hl7:family', NS)
-            if fam is not None and fam.text and fam.text.strip():
-                parts.append(fam.text.strip()[0].upper())
+            if fam is not None and fam.text and fam.text.strip(): parts.append(fam.text.strip()[0].upper())
             initials = "".join(parts) or clean_value(get_text(nm))
 
     # Patient Record Number (mask-aware)
@@ -512,12 +503,45 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
 def build_parent_map(root: ET.Element) -> Dict[ET.Element, ET.Element]:
     return {c: p for p in root.iter() for c in list(p)}
 
+# ---------------- Reaction map: RID -> LLT term ----------------
+def build_reaction_id_to_term(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]] = None) -> Dict[str, str]:
+    """
+    Map reaction OBS id@root -> LLT term for observations with code displayName='reaction'.
+    """
+    out: Dict[str, str] = {}
+    for obs in findall(root, './/hl7:observation[@classCode="OBS"][@moodCode="EVN"]'):
+        code_el = obs.find('hl7:code', NS)
+        if code_el is None or (code_el.attrib.get('displayName') or '').strip().lower() != 'reaction':
+            continue
+
+        # Observation ID (RID)
+        id_el = find_first(obs, './/hl7:id')
+        rid = (id_el.attrib.get('root') or '').strip() if id_el is not None else ''
+        if not rid:
+            continue
+
+        # LLT from <value>
+        llt_term = ""
+        val_el = obs.find('hl7:value', NS)
+        llt_code = (val_el.attrib.get('code') or '').strip() if val_el is not None else ''
+        if meddra_map and llt_code in meddra_map:
+            llt_term = (meddra_map[llt_code].get("LLT Term") or "").strip()
+        if not llt_term and val_el is not None:
+            llt_term = (val_el.attrib.get('displayName') or '').strip()
+            if not llt_term:
+                ot = val_el.find('hl7:originalText', NS)
+                if ot is not None and (ot.text or '').strip():
+                    llt_term = ot.text.strip()
+
+        if rid and llt_term:
+            out[rid] = llt_term
+    return out
+
 # ---------------- Medical History extraction ----------------
 def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]] = None, debug: bool = False) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     pmap = build_parent_map(root)
 
-    # Anchors: relevantMedicalHistoryAndConcurrentConditions
     anchors: List[ET.Element] = []
     for code in root.findall('.//hl7:code', NS):
         if (code.attrib.get('codeSystem') or '').strip() != MH_SECTION_OID:
@@ -675,19 +699,33 @@ def extract_labs(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]
 
     return items
 
-# ---------------- Causality extraction ----------------
-def extract_causality(root: ET.Element, debug: bool = False) -> List[Dict[str, Any]]:
+# ---------------- Causality extraction (filtered, name-resolved) ----------------
+def extract_causality(
+    root: ET.Element,
+    product_id_to_name: Optional[Dict[str, str]] = None,
+    reaction_id_to_term: Optional[Dict[str, str]] = None,
+    debug: bool = False
+) -> List[Dict[str, Any]]:
     """
-    <causalityAssessment classCode="OBS" moodCode="EVN">
-      - value (ST) -> Assessment
-      - methodCode/originalText -> Method
-      - author/assignedEntity/name or originalText -> Assessor
-      - subject1/adverseEffectReference/id@root -> Event Ref ID
-      - subject2/productUseReference/id@root -> Product Ref ID
+    <causalityAssessment classCode="OBS" moodCode="EVN"> entries where:
+      inner <code> has codeSystem=STATUS_OID and (displayName='causality' OR code='39').
+    Output shows human-readable Reaction and Drug names (not IDs).
     """
     out: List[Dict[str, Any]] = []
     try:
         for node in findall(root, './/hl7:causalityAssessment[@classCode="OBS"][@moodCode="EVN"]'):
+            # Filter by code system + meaning
+            ccode = node.find('hl7:code', NS)
+            if ccode is None:
+                continue
+            cs  = (ccode.attrib.get('codeSystem') or '').strip()
+            cd  = (ccode.attrib.get('code') or '').strip()
+            dsn = (ccode.attrib.get('displayName') or '').strip().lower()
+            if cs != STATUS_OID:
+                continue
+            if not (dsn == 'causality' or cd == '39'):
+                continue
+
             # Assessment
             val = find_first(node, './/hl7:value')
             assessment = ""
@@ -715,7 +753,11 @@ def extract_causality(root: ET.Element, debug: bool = False) -> List[Dict[str, A
             if prd is not None:
                 prd_id = (prd.attrib.get('root') or '').strip() or (prd.attrib.get('extension') or '').strip()
 
-            # Pairing key
+            # Resolve names
+            reaction_name = reaction_id_to_term.get(evt_id, "") if (reaction_id_to_term and evt_id) else ""
+            drug_name = product_id_to_name.get(prd_id, "") if (product_id_to_name and prd_id) else ""
+
+            # Internal key for pairing
             key = (evt_id or "") + "::" + (prd_id or "")
             if not key.strip(":"):
                 key = "assess::" + normalize_text(assessment or "") + "::" + normalize_text(method or "")
@@ -724,9 +766,11 @@ def extract_causality(root: ET.Element, debug: bool = False) -> List[Dict[str, A
                 "Assessment": clean_value(assessment),
                 "Method": clean_value(method),
                 "Assessor": clean_value(assessor),
-                "Event Ref ID": clean_value(evt_id),
-                "Product Ref ID": clean_value(prd_id),
-                "_key": key,
+                "Reaction": clean_value(reaction_name),
+                "Drug": clean_value(drug_name),
+                "_key": key,       # internal pairing only
+                "_evt_id": evt_id, # kept internal; not displayed
+                "_prd_id": prd_id, # kept internal; not displayed
             })
     except Exception as e:
         if debug:
@@ -736,7 +780,6 @@ def extract_causality(root: ET.Element, debug: bool = False) -> List[Dict[str, A
 # ---------------- Products extraction (ALL; group by COMPONENT; NO REGIMENS) ----------------
 def extract_suspect_ids(root: ET.Element) -> Set[str]:
     out = set()
-    # Based on causalityAssessment subjects where productUseReference is present
     for c in findall(root, './/hl7:causalityAssessment'):
         sid = find_first(c, './/hl7:subject2/hl7:productUseReference/hl7:id')
         if sid is not None:
@@ -768,36 +811,24 @@ def extract_treatment_ids(root: ET.Element) -> Set[str]:
     return ids
 
 def _resolve_drug_name(admin: ET.Element) -> str:
-    # 1) kindOfProduct/name
     nm = find_first(admin, './/hl7:kindOfProduct/hl7:name')
     if nm is not None:
         t = (nm.text or '').strip()
-        if t:
-            return t
+        if t: return t
         disp = (nm.attrib.get('displayName') or '').strip()
-        if disp:
-            return disp
+        if disp: return disp
         ot = nm.find('hl7:originalText', NS)
-        if ot is not None and (ot.text or '').strip():
-            return ot.text.strip()
-    # 2) manufacturedProduct/name
+        if ot is not None and (ot.text or '').strip(): return ot.text.strip()
     alt = find_first(admin, './/hl7:manufacturedProduct/hl7:name')
-    if alt is not None and (alt.text or '').strip():
-        return alt.text.strip()
-    # 3) manufacturedMaterial/name
+    if alt is not None and (alt.text or '').strip(): return alt.text.strip()
     mm = find_first(admin, './/hl7:manufacturedMaterial/hl7:name')
-    if mm is not None and (mm.text or '').strip():
-        return mm.text.strip()
-    # 4) manufacturedMaterial/code@displayName
+    if mm is not None and (mm.text or '').strip(): return mm.text.strip()
     mm_code = find_first(admin, './/hl7:manufacturedMaterial/hl7:code')
     if mm_code is not None:
         disp = (mm_code.attrib.get('displayName') or '').strip()
-        if disp:
-            return disp
-    # 5) asManufacturedProduct//name
+        if disp: return disp
     amp = find_first(admin, './/hl7:asManufacturedProduct//hl7:name')
-    if amp is not None and (amp.text or '').strip():
-        return amp.text.strip()
+    if amp is not None and (amp.text or '').strip(): return amp.text.strip()
     return ""
 
 def _iter_drug_components(root: ET.Element) -> List[ET.Element]:
@@ -909,7 +940,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
                     break
             _add_unique(agg["MAH"], mah)
 
-        # ---- Action Taken (scan inside this component)
+        # ---- Action Taken
         for act_code in comp.findall('.//hl7:act[@classCode="ACT"][@moodCode="EVN"]/hl7:code', NS):
             if (act_code.attrib.get('codeSystem') or '').strip() == ACTION_TAKEN_OID:
                 c = (act_code.attrib.get('code') or '').strip()
@@ -917,7 +948,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
                 if label:
                     _add_unique(agg["Action Taken"], label)
 
-        # ---- Drug Obtain Country: any <country> text within this component
+        # ---- Drug Obtain Country
         for cn in comp.findall('.//hl7:country', NS):
             val = (cn.text or '').strip()
             if val:
@@ -985,8 +1016,7 @@ def find_all_source_report_containers(root: ET.Element) -> List[ET.Element]:
     seen, uniq = set(), []
     for el in containers:
         if id(el) not in seen:
-            seen.add(id(el))
-            uniq.append(el)
+            seen.add(id(el)); uniq.append(el)
     return uniq
 
 def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
@@ -1011,12 +1041,9 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
     for id_el in node.findall('.//hl7:id', NS):
         ext = (id_el.attrib.get('extension') or '').strip()
         rt  = (id_el.attrib.get('root') or '').strip()
-        if ext and rt:
-            ids.append(f"{ext} ({rt})")
-        elif ext:
-            ids.append(ext)
-        elif rt:
-            ids.append(rt)
+        if ext and rt: ids.append(f"{ext} ({rt})")
+        elif ext: ids.append(ext)
+        elif rt: ids.append(rt)
     if ids:
         result["Reporter IDs"] = "; ".join(dict.fromkeys(ids))
 
@@ -1025,8 +1052,7 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
     for code_el in node.iter():
         if local_name(code_el.tag) == 'code' and code_el.attrib.get('codeSystem') == REPORTER_QUAL_OID:
             c = (code_el.attrib.get('code') or '').strip()
-            qual = REPORTER_MAP.get(c, c)
-            break
+            qual = REPORTER_MAP.get(c, c); break
     result["Reporter Qualification"] = qual
 
     # Name parts — mask-aware
@@ -1067,8 +1093,7 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
     if addr is not None:
         for sl in addr.findall('hl7:streetAddressLine', NS):
             val = read_text_or_mask(sl)
-            if val:
-                streets.append(val)
+            if val: streets.append(val)
         city   = read_text_or_mask(addr.find('hl7:city', NS))
         state  = read_text_or_mask(addr.find('hl7:state', NS))
         postal = read_text_or_mask(addr.find('hl7:postalCode', NS))
@@ -1088,7 +1113,7 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
     for tel in node.findall('.//hl7:telecom', NS):
         raw = (tel.attrib.get('value') or '').strip()
         use = (tel.attrib.get('use') or '').upper()
-        if not raw:
+        if not raw: 
             continue
         low = raw.lower()
         if low.startswith('mailto:'):
@@ -1101,17 +1126,14 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
             if '@' in raw:
                 emails.append(raw.replace('mailto:', ''))
             else:
-                digits = re.sub(r'\D', '', raw)
+                digits = re.sub(r'\D','',raw)
                 if len(digits) >= 7:
                     phones.append(raw)
                 else:
                     phones.append(raw)
-    if phones:
-        result["Reporter Phone(s)"] = "; ".join(dict.fromkeys(phones))
-    if emails:
-        result["Reporter Email(s)"] = "; ".join(dict.fromkeys(emails))
-    if faxes:
-        result["Reporter Fax(es)"]  = "; ".join(dict.fromkeys(faxes))
+    if phones: result["Reporter Phone(s)"] = "; ".join(dict.fromkeys(phones))
+    if emails: result["Reporter Email(s)"] = "; ".join(dict.fromkeys(emails))
+    if faxes:  result["Reporter Fax(es)"]  = "; ".join(dict.fromkeys(faxes))
     return result
 
 def extract_reporters_from_sourceReport(root: ET.Element) -> List[Dict[str, str]]:
@@ -1219,7 +1241,7 @@ def extract_narrative(root: ET.Element) -> str:
     txt = narrative_elem.text if narrative_elem is not None else ''
     return clean_value(txt)
 
-# ---------------- Model builder ----------------
+# ---------------- Model builder (with name maps for causality) ----------------
 def extract_model(xml_bytes: bytes, meddra_map: Optional[Dict[str, Dict[str,str]]] = None,
                   debug_events: bool = False, debug_mh: bool = False, debug_lab: bool = False, debug_caus: bool = False) -> Dict[str, Any]:
     try:
@@ -1233,11 +1255,32 @@ def extract_model(xml_bytes: bytes, meddra_map: Optional[Dict[str, Dict[str,str]
     model.update(extract_td_frd_lrd(root))
     model["Reporters"] = extract_reporters_from_sourceReport(root)
     model["Patient"] = extract_patient(root)
+
+    # Clinical sections
     model["MedicalHistory"] = extract_medical_history(root, meddra_map=meddra_map, debug=debug_mh)
-    model["LabDetails"] = extract_labs(root, meddra_map=meddra_map, debug=debug_lab)
-    model["Causality"] = extract_causality(root, debug=debug_caus)
-    model["Products"] = extract_all_products(root)
+    model["LabDetails"]     = extract_labs(root, meddra_map=meddra_map, debug=debug_lab)
+
+    # Products first (for name map)
+    products = extract_all_products(root)
+    model["Products"] = products
+
+    # Events (independent)
     model["Events"] = extract_events(root, meddra_map=meddra_map, debug=debug_events)
+
+    # Build maps for causality name resolution
+    product_id_to_name = { (p.get("_pid") or "").strip(): (p.get("Drug") or "").strip()
+                           for p in products if (p.get("_pid") or "").strip() }
+    reaction_id_to_term = build_reaction_id_to_term(root, meddra_map=meddra_map)
+
+    # Causality with name resolution & OID filter
+    model["Causality"] = extract_causality(
+        root,
+        product_id_to_name=product_id_to_name,
+        reaction_id_to_term=reaction_id_to_term,
+        debug=debug_caus
+    )
+
+    # Narrative
     model["Narrative"] = extract_narrative(root)
     return model
 
@@ -1481,12 +1524,14 @@ else:
         make_lab_box_for_ui(se, pe, title)
 
 # ---------------- SECTION: Causality Details ----------------
-st.subheader("Causality Details — matched by (Event Ref ID, Product Ref ID)")
+st.subheader("Causality Details — matched by (Reaction, Drug) when available")
+
 src_caus = src.get("Causality", []) or []
 prc_caus = prc.get("Causality", []) or []
 
 def _key_caus(item: Dict[str,Any]) -> str:
-    k = (item.get("Event Ref ID","") or "") + "::" + (item.get("Product Ref ID","") or "")
+    # Prefer hidden IDs for stable pairing; fallback to Assessment+Method
+    k = (item.get("_evt_id","") or "") + "::" + (item.get("_prd_id","") or "")
     if not k.strip(":"):
         k = "assess::" + normalize_text(item.get("Assessment","")) + "::" + normalize_text(item.get("Method",""))
     return k
@@ -1501,8 +1546,8 @@ def make_caus_box_for_ui(s: Dict[str,Any], p: Dict[str,Any], title_hint: str):
         ("Assessment","text"),
         ("Method","text"),
         ("Assessor","text"),
-        ("Event Ref ID","text"),
-        ("Product Ref ID","text"),
+        ("Reaction","text"),
+        ("Drug","text"),
     ]
     rows = [(f, s.get(f,""), p.get(f,"")) for f, _ in fields]
     df = compare_table(rows, treat_as_dates=False)
@@ -1518,7 +1563,10 @@ else:
     for key in all_caus_keys:
         se = src_caus_idx.get(key, {})
         pe = prc_caus_idx.get(key, {})
-        title = se.get("Assessment") or pe.get("Assessment") or "(Unnamed causality)"
+        # Prefer Reaction + Drug for title
+        t = (se.get("Reaction") or pe.get("Reaction") or "")
+        d = (se.get("Drug") or pe.get("Drug") or "")
+        title = f'{t} — {d}'.strip(' —') or (se.get("Assessment") or pe.get("Assessment") or "(Causality)")
         make_caus_box_for_ui(se, pe, title)
 
 # ---------------- SECTION: Drug Details (ALL products; grouped by COMPONENT; NO REGIMENS) ----------------
