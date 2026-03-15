@@ -1312,14 +1312,14 @@ def make_drug_compare_table(src_rec: Dict[str,Any], prc_rec: Dict[str,Any]) -> p
     return compare_table(rows, treat_as_dates=False)
 
 # --------------- UI: Upload & Parse ----------------
-st.markdown("### 📤 Upload the two XML files you want to compare (and optional MedDRA mapping)")
+st.markdown("### 📤 Upload the XML files to compare (and optional MedDRA File)")
 col1, col2 = st.columns(2)
 with col1:
     src_file = st.file_uploader("Source XML", type=["xml"], key="src_xml")
 with col2:
     prc_file = st.file_uploader("Processed XML", type=["xml"], key="prc_xml")
 mapping_file = st.file_uploader(
-    "MedDRA LLT–PT Mapping (.xlsx or .csv) — columns: LLT Code, LLT Term, PT Code, PT Term",
+    "MedDRA File",
     type=["xlsx", "csv"], key="meddra_map"
 )
 meddra_map = load_meddra_mapping(mapping_file) if mapping_file else {}
