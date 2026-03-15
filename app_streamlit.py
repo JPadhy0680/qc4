@@ -3,14 +3,14 @@ import streamlit as st
 import pandas as pd
 import xml.etree.ElementTree as ET
 from datetime import datetime, date
-import io, re, calendar
+import io, re, calendar, zipfile
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 # ---------------- UI setup ----------------
 st.set_page_config(page_title="E2B_R3 Two-File Comparator (Tabular, Box-wise)", layout="wide")
 st.title("🧪📄📄 E2B_R3 Two‑File Comparator — Tabular, Box‑wise")
 
-# Optional debug control (Events / MH parsing warnings)
+# Optional debug toggles
 DEBUG_EVENTS = st.sidebar.checkbox("Debug events parsing", value=False)
 DEBUG_MH = st.sidebar.checkbox("Debug medical history parsing", value=False)
 
@@ -34,13 +34,11 @@ REPORTER_MAP = {
     "5": "Consumer or other non-health professional",
 }
 
-# Reporter SOURCE anchor OID (to locate reporter branches)
+# Reporter SOURCE anchor OID
 REPORT_SOURCE_OID  = "2.16.840.1.113883.3.989.2.1.1.22"  # displayName="sourceReport"
 
-# Patient: Age observation OID
+# Patient OIDs
 AGE_OID            = "2.16.840.1.113883.3.989.2.1.1.19"
-
-# Patient: Record Number OID
 PATIENT_RECORD_OID = "2.16.840.1.113883.3.989.2.1.3.7"
 
 # ---- Action Taken ----
@@ -55,7 +53,9 @@ ACTION_TAKEN_MAP = {
 }
 
 # MedDRA OIDs
-MEDDRA_LLT_OID = "2.16.840.1.113883.6.163"  # used for LLT codes in observations
+MEDDRA_LLT_OID = "2.16.840.1.113883.6.163"  # LLT codes in observations
+MH_SECTION_OID = "2.16.840.1.113883.3.989.2.1.1.20"  # relevantMedicalHistoryAndConcurrentConditions
+STATUS_OID     = "2.16.840.1.113883.3.989.2.1.1.19"  # status codes (e.g., continuing)
 
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
 TD_PATHS = [
@@ -157,42 +157,161 @@ def has_value(x: str) -> bool:
 def safe_disp(v: str) -> str:
     return v if v else "—"
 
-# ---- MedDRA mapping loader ----
-def load_meddra_mapping(xlsx_file) -> Dict[str, Dict[str, str]]:
+# ---------------- Dependency-free XLSX reader (simple) ----------------
+def _col_letters_to_index(col_letters: str) -> int:
+    """Convert Excel column letters (A, B, ... AA, AB ...) to 0-based index."""
+    res = 0
+    for ch in col_letters:
+        if not ch.isalpha(): break
+        res = res * 26 + (ord(ch.upper()) - ord('A') + 1)
+    return res - 1  # 0-based
+
+def _parse_sheet_xml(sheet_xml_bytes: bytes, shared_strings: List[str]) -> pd.DataFrame:
     """
-    Reads an Excel with columns (case-insensitive):
-      'LLT Code', 'LLT Term', 'PT Code', 'PT Term'
-    Returns { llt_code_str : {'LLT Term':..., 'PT Code':..., 'PT Term':...} }
+    Minimal parser for xl/worksheets/sheet*.xml into DataFrame.
+    - Uses first row as headers
+    - Supports shared strings (t="s"), inlineStr, and numeric/text values
     """
-    if not xlsx_file:
-        return {}
+    from xml.etree.ElementTree import fromstring
+    root = fromstring(sheet_xml_bytes)
+    ns = {'a': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+
+    rows = []
+    max_col = 0
+
+    for row in root.findall('.//a:sheetData/a:row', ns):
+        values: Dict[int, str] = {}
+        for c in row.findall('a:c', ns):
+            r = c.attrib.get('r', '')  # e.g., "A1"
+            # column letters part
+            col_letters = ''.join([ch for ch in r if ch.isalpha()]) or 'A'
+            col_idx = _col_letters_to_index(col_letters)
+            if col_idx > max_col:
+                max_col = col_idx
+            value = ""
+            t = c.attrib.get('t', '')
+            v = c.find('a:v', ns)
+            is_node = c.find('a:is', ns)
+
+            if t == 's':  # shared string
+                if v is not None and v.text and v.text.isdigit():
+                    ss_idx = int(v.text)
+                    if 0 <= ss_idx < len(shared_strings):
+                        value = shared_strings[ss_idx]
+            elif t == 'inlineStr' and is_node is not None:
+                tnode = is_node.find('a:t', ns)
+                value = (tnode.text or '') if tnode is not None else ''
+            else:
+                # numeric or general
+                value = (v.text or '') if v is not None else ''
+
+            values[col_idx] = value
+        if values:
+            # build row list up to max_col
+            row_list = ["" for _ in range(max_col + 1)]
+            for idx, val in values.items():
+                if idx <= max_col:
+                    row_list[idx] = val
+            rows.append(row_list)
+
+    if not rows:
+        return pd.DataFrame()
+
+    # First non-empty row as header
+    header = rows[0]
+    data = rows[1:] if len(rows) > 1 else []
+    # Make sure headers are unique/non-empty
+    header = [h if h else f"col_{i+1}" for i, h in enumerate(header)]
+    return pd.DataFrame(data, columns=header)
+
+def _read_xlsx_no_openpyxl(uploaded_file) -> pd.DataFrame:
+    """
+    Read .xlsx using only stdlib (zipfile + xml); supports simple flat sheets.
+    """
+    data = uploaded_file.read()  # bytes
+    zf = zipfile.ZipFile(io.BytesIO(data))
+
+    # shared strings (optional)
+    shared_strings: List[str] = []
     try:
-        df = pd.read_excel(xlsx_file, engine="openpyxl")
-    except Exception as e:
-        st.warning(f"Failed to read MedDRA mapping: {e}")
+        sst = zf.read('xl/sharedStrings.xml')
+        # parse shared strings
+        sroot = ET.fromstring(sst)
+        s_ns = {'a': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+        for si in sroot.findall('.//a:si', s_ns):
+            # strings may be split across multiple <t> nodes
+            parts = []
+            for tnode in si.findall('.//a:t', s_ns):
+                parts.append(tnode.text or '')
+            shared_strings.append(''.join(parts))
+    except KeyError:
+        # no sharedStrings.xml
+        shared_strings = []
+
+    # pick first worksheet (sheet1.xml or first in xl/worksheets/)
+    sheet_bytes = None
+    try:
+        sheet_bytes = zf.read('xl/worksheets/sheet1.xml')
+    except KeyError:
+        # find any sheet xml under xl/worksheets/
+        for name in zf.namelist():
+            if name.startswith('xl/worksheets/') and name.endswith('.xml'):
+                sheet_bytes = zf.read(name)
+                break
+    if sheet_bytes is None:
+        raise ValueError("No worksheet XML found in XLSX.")
+
+    return _parse_sheet_xml(sheet_bytes, shared_strings)
+
+# ---- MedDRA mapping loader (no openpyxl needed) ----
+def load_meddra_mapping(uploaded_file) -> Dict[str, Dict[str, str]]:
+    """
+    Loads MedDRA mapping from:
+      - XLSX (parsed with stdlib zipfile + XML; no openpyxl required)
+      - CSV
+    Required columns (case-insensitive): LLT Code, LLT Term, PT Code, PT Term
+    Returns: { llt_code_str : {'LLT Term':..., 'PT Code':..., 'PT Term':...} }
+    """
+    if not uploaded_file:
         return {}
+
+    fname = (uploaded_file.name or "").lower()
+    try:
+        if fname.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        elif fname.endswith(".xlsx"):
+            # parse without openpyxl
+            df = _read_xlsx_no_openpyxl(uploaded_file)
+        else:
+            st.error("Unsupported MedDRA file format. Please upload .xlsx or .csv")
+            return {}
+    except Exception as e:
+        st.error(f"Could not read MedDRA mapping: {e}")
+        return {}
+
+    # Validate columns
     cols = {c.strip().lower(): c for c in df.columns}
     required = ['llt code', 'llt term', 'pt code', 'pt term']
-    if not all(c in cols for c in required):
-        st.warning("MedDRA mapping file must include columns: LLT Code, LLT Term, PT Code, PT Term (case-insensitive).")
+    if not all(k in cols for k in required):
+        st.error("MedDRA mapping must contain columns: LLT Code, LLT Term, PT Code, PT Term")
         return {}
-    # Normalize into strings
-    map_dict: Dict[str, Dict[str, str]] = {}
+
+    mapping: Dict[str, Dict[str, str]] = {}
     for _, row in df.iterrows():
         try:
             llt_code = str(row[cols['llt code']]).strip()
             if not llt_code or llt_code.lower() in {"nan", "none"}:
                 continue
-            llt_term = str(row[cols['llt term']]).strip() if pd.notna(row[cols['llt term']]) else ""
-            pt_code  = str(row[cols['pt code']]).strip()  if pd.notna(row[cols['pt code']])  else ""
-            pt_term  = str(row[cols['pt term']]).strip()  if pd.notna(row[cols['pt term']])  else ""
-            if llt_code not in map_dict:
-                map_dict[llt_code] = {"LLT Term": llt_term, "PT Code": pt_code, "PT Term": pt_term}
+            mapping[llt_code] = {
+                "LLT Term": str(row[cols['llt term']]).strip() if pd.notna(row[cols['llt term']]) else "",
+                "PT Code":  str(row[cols['pt code']]).strip()  if pd.notna(row[cols['pt code']])  else "",
+                "PT Term":  str(row[cols['pt term']]).strip()  if pd.notna(row[cols['pt term']])  else "",
+            }
         except Exception:
             continue
-    if map_dict:
-        st.success(f"MedDRA mapping loaded — {len(map_dict):,} LLT rows")
-    return map_dict
+
+    st.success(f"MedDRA Mapping Loaded — {len(mapping):,} LLT rows")
+    return mapping
 
 # ---- Generic patient observation resolver (displayName OR OID) ----
 def get_pq_value_by_code(
@@ -284,7 +403,7 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
     gender_code = gender_elem.attrib.get('code', '') if gender_elem is not None else ''
     gender = clean_value(map_gender(gender_code))
 
-    # Age: displayName OR OID
+    # Age
     age_val, age_unit_raw = get_pq_value_by_code(root, display_name="age", code_system_oid=AGE_OID)
     unit_map = {'a': 'year', 'b': 'month'}
     age_unit_label = unit_map.get((age_unit_raw or '').lower(), age_unit_raw or '')
@@ -310,14 +429,12 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
     if not (w_val or w_unit):
         for obs in root.findall('.//hl7:observation', NS):
             val = obs.find('hl7:value', NS)
-            if val is None: 
-                continue
+            if val is None: continue
             u = (val.attrib.get('unit') or '').strip().lower()
             if u in {'kg','lb','lbs'}:
                 w_val = (val.attrib.get('value') or '').strip()
                 w_unit = (val.attrib.get('unit') or '').strip()
-                if w_val:
-                    break
+                if w_val: break
     weight = ""
     if clean_value(w_val):
         weight = clean_value(w_val)
@@ -331,21 +448,19 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
     if not (h_val or h_unit):
         for obs in root.findall('.//hl7:observation', NS):
             val = obs.find('hl7:value', NS)
-            if val is None: 
-                continue
+            if val is None: continue
             u = (val.attrib.get('unit') or '').strip().lower()
             if u in {'cm','m','in'}:
                 h_val = (val.attrib.get('value') or '').strip()
                 h_unit = (val.attrib.get('unit') or '').strip()
-                if h_val:
-                    break
+                if h_val: break
     height = ""
     if clean_value(h_val):
         height = clean_value(h_val)
         if clean_value(h_unit):
             height = f"{height} {h_unit}"
 
-    # Initials (mask-aware)
+    # Initials
     initials = ""
     nm = find_first(root, './/hl7:player1/hl7:name')
     if nm is not None:
@@ -359,7 +474,7 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
             if fam is not None and fam.text and fam.text.strip(): parts.append(fam.text.strip()[0].upper())
             initials = "".join(parts) or clean_value(get_text(nm))
 
-    # Patient Record Number (mask-aware)
+    # Patient Record Number
     patient_record_no = find_mask_aware_id_by_root(root, PATIENT_RECORD_OID)
 
     return {
@@ -379,24 +494,18 @@ def build_parent_map(root: ET.Element) -> Dict[ET.Element, ET.Element]:
 def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]] = None, debug: bool = False) -> List[Dict[str, Any]]:
     """
     Extracts 'Relevant Medical History and Concurrent Conditions' entries.
-    Anchor: <code code="1" codeSystem="2.16.840.1.113883.3.989.2.1.1.20" ... displayName="relevantMedicalHistoryAndConcurrentConditions"/>
-    Within that subsection:
-      - observation (OBS/EVN) with MedDRA codeSystem 2.16.840.1.113883.6.163 -> LLT code/term
-      - status from inboundRelationship/observation where codeSystem=2.16.840.1.113883.3.989.2.1.1.19 and BL true
-      - effectiveTime low/high -> Start/End
-      - decode LLT -> (LLT Term / PT Code / PT Term) via meddra_map
+    Anchor: codeSystem=MH_SECTION_OID (code=1 or displayName matches).
+    Each OBS/EVN with MedDRA LLT code (MEDDRA_LLT_OID) becomes one item.
+    Decodes LLT -> (LLT Term / PT Code / PT Term) via meddra_map when available.
     """
-    MH_OID = "2.16.840.1.113883.3.989.2.1.1.20"
-    STATUS_OID = "2.16.840.1.113883.3.989.2.1.1.19"
-
     items: List[Dict[str, Any]] = []
     pmap = build_parent_map(root)
     warnings: List[str] = []
 
-    # Find anchors for the section
+    # Find anchors
     anchors: List[ET.Element] = []
     for code in root.findall('.//hl7:code', NS):
-        if (code.attrib.get('codeSystem') or '').strip() != MH_OID:
+        if (code.attrib.get('codeSystem') or '').strip() != MH_SECTION_OID:
             continue
         c = (code.attrib.get('code') or '').strip()
         disp = (code.attrib.get('displayName') or '').strip().lower()
@@ -414,17 +523,15 @@ def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dic
                 continue
 
             llt_code = (code.attrib.get('code') or '').strip()
-            # prefer mapping for LLT term/PTs
+            # prefer mapping
             llt_term = ""
             pt_code = ""
             pt_term = ""
-
             if meddra_map and llt_code in meddra_map:
                 m = meddra_map[llt_code]
                 llt_term = (m.get("LLT Term") or "").strip()
                 pt_code  = (m.get("PT Code") or "").strip()
                 pt_term  = (m.get("PT Term") or "").strip()
-
             if not llt_term:
                 llt_term = (code.attrib.get('displayName') or '').strip()
                 if not llt_term:
@@ -655,7 +762,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
                 if label:
                     _add_unique(agg["Action Taken"], label)
 
-        # ---- Drug Obtain Country: any <country> text (e.g., GB) within this component
+        # ---- Drug Obtain Country: any <country> text within this component
         for cn in comp.findall('.//hl7:country', NS):
             val = (cn.text or '').strip()
             if val:
@@ -847,7 +954,7 @@ def extract_reporters_from_sourceReport(root: ET.Element) -> List[Dict[str, str]
             reporters.append(rep)  # sequential; no matching
     return reporters
 
-# ---------------- Events extraction (aligned with app.py logic + MedDRA decode) ----------------
+# ---------------- Events extraction (with MedDRA decode) ----------------
 def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]] = None, debug: bool = False) -> List[Dict[str, Any]]:
     seriousness_map = {
         "resultsInDeath": "Death",
@@ -880,7 +987,7 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str
                 val_el = rxn.find('hl7:value', NS)
                 llt_code = (val_el.attrib.get('code') or '').strip() if val_el is not None else ''
 
-                # Decode via MedDRA mapping if available
+                # Decode MedDRA if available
                 llt_term = ""
                 pt_code = ""
                 pt_term = ""
@@ -889,7 +996,6 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str
                     llt_term = (m.get("LLT Term") or "").strip()
                     pt_code  = (m.get("PT Code") or "").strip()
                     pt_term  = (m.get("PT Term") or "").strip()
-                # fallback to displayName if LLT Term still empty
                 if not llt_term and val_el is not None:
                     llt_term = (val_el.attrib.get('displayName') or '').strip()
                     if not llt_term:
@@ -1030,6 +1136,9 @@ def make_patient_table(src_pat: Dict[str,str], prc_pat: Dict[str,str]) -> pd.Dat
 
 # ------ Drug UI helpers (name/pid-matching; NO REGIMENS) ------
 def _drug_match_key(rec: Dict[str, Any]) -> str:
+    """
+    Match by Drug name (normalized), else _pid, else _gid.
+    """
     title = (rec.get("Drug") or "").strip()
     if title:
         return f"name::{normalize_text(title)}"
@@ -1077,8 +1186,8 @@ with col2:
     prc_file = st.file_uploader("Processed XML", type=["xml"], key="prc_xml")
 
 mapping_file = st.file_uploader(
-    "MedDRA LLT–PT Mapping (Excel) — columns: LLT Code, LLT Term, PT Code, PT Term",
-    type=["xlsx"], key="meddra_map"
+    "MedDRA LLT–PT Mapping (.xlsx or .csv) — columns: LLT Code, LLT Term, PT Code, PT Term",
+    type=["xlsx", "csv"], key="meddra_map"
 )
 meddra_map = load_meddra_mapping(mapping_file) if mapping_file else {}
 
@@ -1191,7 +1300,7 @@ prc_prods = prc.get("Products", [])
 src_idx = index_by_match_key(src_prods)
 prc_idx = index_by_match_key(prc_prods)
 
-# Preserve Source encounter order first, then Processed-only
+# Preserve Source order first, then Processed-only
 ordered_keys: List[str] = []
 seen_keys = set()
 
@@ -1371,7 +1480,9 @@ def build_excel_bytes() -> Optional[bytes]:
             "Source Narrative": src.get("Narrative","") or "—",
             "Processed Narrative": prc.get("Narrative","") or "—"
         }])
+
     excel_buffer = io.BytesIO()
+    # Try openpyxl then xlsxwriter; if both unavailable, notify
     for engine in ("openpyxl", "xlsxwriter"):
         try:
             with pd.ExcelWriter(excel_buffer, engine=engine) as writer:
