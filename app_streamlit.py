@@ -39,7 +39,7 @@ REPORT_SOURCE_OID  = "2.16.840.1.113883.3.989.2.1.1.22"  # displayName="sourceRe
 # Patient: Age observation OID
 AGE_OID            = "2.16.840.1.113883.3.989.2.1.1.19"  # 'age' observation system
 
-# Patient: Record Number OID (new)
+# Patient: Record Number OID
 PATIENT_RECORD_OID = "2.16.840.1.113883.3.989.2.1.3.7"
 
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
@@ -238,11 +238,7 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
     gender = clean_value(map_gender(gender_code))
 
     # Age: support displayName OR OID (AGE_OID)
-    age_val, age_unit_raw = get_pq_value_by_code(
-        root,
-        display_name="age",
-        code_system_oid=AGE_OID
-    )
+    age_val, age_unit_raw = get_pq_value_by_code(root, display_name="age", code_system_oid=AGE_OID)
     unit_map = {'a': 'year', 'b': 'month'}
     age_unit_label = unit_map.get((age_unit_raw or '').lower(), age_unit_raw or '')
     age = ""
@@ -329,7 +325,7 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
         "Patient Record Number": clean_value(patient_record_no),
     }
 
-# ---------------- Products extraction ----------------
+# ---------------- Products extraction (ALL + robust grouping) ----------------
 def extract_suspect_ids(root: ET.Element) -> Set[str]:
     out = set()
     for c in findall(root, './/hl7:causalityAssessment'):
@@ -362,34 +358,81 @@ def extract_treatment_ids(root: ET.Element) -> Set[str]:
                 ids.add(ref.attrib.get('root',''))
     return ids
 
+def _resolve_drug_name(admin: ET.Element) -> str:
+    """
+    Try multiple, realistic paths to get a human-readable product name.
+    Returns '' if a name cannot be found anywhere.
+    """
+    # 1) kindOfProduct/name (text or @displayName or <originalText>)
+    nm = find_first(admin, './/hl7:kindOfProduct/hl7:name')
+    if nm is not None:
+        t = (nm.text or '').strip()
+        if t:
+            return t
+        disp = (nm.attrib.get('displayName') or '').strip()
+        if disp:
+            return disp
+        ot = nm.find('hl7:originalText', NS)
+        if ot is not None and (ot.text or '').strip():
+            return ot.text.strip()
+
+    # 2) manufacturedProduct/name
+    alt = find_first(admin, './/hl7:manufacturedProduct/hl7:name')
+    if alt is not None and (alt.text or '').strip():
+        return alt.text.strip()
+
+    # 3) manufacturedMaterial/name
+    mm = find_first(admin, './/hl7:manufacturedMaterial/hl7:name')
+    if mm is not None and (mm.text or '').strip():
+        return mm.text.strip()
+
+    # 4) code@displayName under manufacturedMaterial
+    mm_code = find_first(admin, './/hl7:manufacturedMaterial/hl7:code')
+    if mm_code is not None:
+        disp = (mm_code.attrib.get('displayName') or '').strip()
+        if disp:
+            return disp
+
+    # 5) asManufacturedProduct/.../name
+    amp = find_first(admin, './/hl7:asManufacturedProduct//hl7:name')
+    if amp is not None and (amp.text or '').strip():
+        return amp.text.strip()
+
+    return ""
+
 def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
     """
     Extract ALL substanceAdministration records.
     Classify each as Suspect / Interacting / Treatment / Concomitant.
     Preserve multiple regimens (one record per administration).
+    Ensure all regimens for the same product fall under ONE group (by name if present; else by ID).
     """
     suspects   = extract_suspect_ids(root)
     interact   = extract_interacting_ids(root)
     treatments = extract_treatment_ids(root)
 
     prods: List[Dict[str, Any]] = []
+    running_unnamed_idx = 0  # only used if both name and pid are missing
 
     for admin in findall(root, './/hl7:substanceAdministration'):
-        # Product ID (use first <id>)
+        # Product ID (first <id>)
         id_elem = find_first(admin, './/hl7:id')
-        pid = id_elem.attrib.get('root','') if id_elem is not None else ''
+        pid = (id_elem.attrib.get('root', '') if id_elem is not None else '').strip()
 
-        # Drug name
-        nm = find_first(admin, './/hl7:kindOfProduct/hl7:name')
-        raw_name = ""
-        if nm is not None:
-            raw_name = (nm.text or "").strip() or clean_value(nm.attrib.get('displayName', ''))
-            if not raw_name:
-                ot = nm.find('hl7:originalText', NS)
-                raw_name = get_text(ot)
-        if not raw_name:
-            alt = find_first(admin, './/hl7:manufacturedProduct/hl7:name')
-            raw_name = get_text(alt)
+        # Robust name resolution
+        raw_name = _resolve_drug_name(admin).strip()
+
+        # Canonical key to group the drug:
+        #  - Prefer normalized name
+        #  - Else pid
+        #  - Else a stable synthetic fallback
+        if raw_name:
+            name_key = normalize_text(raw_name)
+        elif pid:
+            name_key = f"pid::{pid.lower()}"
+        else:
+            running_unnamed_idx += 1
+            name_key = f"drug#{running_unnamed_idx:03d}"
 
         # Dosage text & quantity
         txt = get_text(find_first(admin, './/hl7:text'))
@@ -398,7 +441,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
         dose_u = dq.attrib.get('unit','') if dq is not None else ''
 
         # Dates
-        low = find_first(admin, './/hl7:effectiveTime/hl7:low')
+        low  = find_first(admin, './/hl7:effectiveTime/hl7:low')
         high = find_first(admin, './/hl7:effectiveTime/hl7:high')
         sd_raw = (low.attrib.get('value') or '').strip() if low is not None else ''
         ed_raw = (high.attrib.get('value') or '').strip() if high is not None else ''
@@ -430,7 +473,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
         if not tags:                  tags.append("Concomitant")
 
         prods.append({
-            "Drug": clean_value(raw_name),
+            "Drug": clean_value(raw_name) if raw_name else (pid or ""),
             "Type": ", ".join(sorted(set(tags))),
             "Dosage Text": clean_value(txt),
             "Dose Value": clean_value(dose_v),
@@ -441,16 +484,17 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
             "Formulation": clean_value(form),
             "Lot No": clean_value(lot),
             "MAH": clean_value(mah),
-            "_name_key": normalize_text(raw_name) if raw_name else "",
+            "_name_key": name_key,    # unified grouping key
             "_pid": pid or "",
         })
 
-    # Regimen numbering within each drug group
+    # Number regimens within each drug group in encounter order
     counts: Dict[str, int] = {}
     for rec in prods:
-        key = rec.get("_name_key","") or rec.get("Drug","").lower()
-        counts[key] = counts.get(key, 0) + 1
-        rec["_regimen_no"] = counts[key]
+        k = rec["_name_key"]
+        counts[k] = counts.get(k, 0) + 1
+        rec["_regimen_no"] = counts[k]
+
     return prods
 
 # ---------------- Reporter extraction (STRICT: only branches with sourceReport; list ALL; pair sequentially) ----------------
@@ -720,7 +764,7 @@ def extract_model(xml_bytes: bytes, debug_events: bool = False) -> Dict[str, Any
     model.update(extract_td_frd_lrd(root))
     model["Reporters"] = extract_reporters_from_sourceReport(root)
     model["Patient"] = extract_patient(root)
-    model["Products"] = extract_all_products(root)   # ALL drugs with types + regimens
+    model["Products"] = extract_all_products(root)   # ALL drugs with types + regimens (grouped by robust key)
     model["Events"] = extract_events(root, debug=debug_events)
     model["Narrative"] = extract_narrative(root)
     return model
@@ -757,7 +801,7 @@ def make_reporter_pair_table(src_rep: Dict[str,str], prc_rep: Dict[str,str]) -> 
     fields = [
         "Reporter Qualification",
         "Reporter IDs",
-        "Reporter Title",          # NEW
+        "Reporter Title",
         "Reporter Name (Full)",
         "Reporter Given Name(s)",
         "Reporter Family Name",
@@ -779,13 +823,32 @@ def make_patient_table(src_pat: Dict[str,str], prc_pat: Dict[str,str]) -> pd.Dat
     rows = [(f, src_pat.get(f,""), prc_pat.get(f,"")) for f in fields]
     return compare_table(rows, treat_as_dates=False)
 
-# ------ Drug UI helpers: group by drug name and show regimens side-by-side ------
+# ------ Drug UI helpers: grouping + per-drug de-dup of identical regimens ------
 def group_products_by_name(products: List[Dict[str,Any]]) -> Dict[str, List[Dict[str,Any]]]:
+    """
+    Groups by the canonical '_name_key' produced in extract_all_products.
+    Never returns a blank key; order preserved.
+    """
     groups: Dict[str, List[Dict[str,Any]]] = {}
     for rec in products:
-        k = rec.get("_name_key","") or normalize_text(rec.get("Drug",""))
+        k = rec.get("_name_key") or "drug#000"
         groups.setdefault(k, []).append(rec)
     return groups
+
+def _dedupe_regimens(regs: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
+    """
+    Remove exact duplicate regimen rows within a drug group (keeps encounter order).
+    """
+    seen = set()
+    out  = []
+    keep_fields = ("Type","Dosage Text","Dose Value","Dose Unit","Start Date","Stop Date","Route","Formulation","Lot No","MAH")
+    for r in regs:
+        sig = tuple((r.get(f,"") or "") for f in keep_fields)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(r)
+    return out
 
 def make_regimen_pair_table(src_rec: Dict[str,Any], prc_rec: Dict[str,Any]) -> pd.DataFrame:
     fields = [
@@ -875,8 +938,13 @@ st.subheader("Drug Details (all products) — grouped by drug name; regimen-wise
 
 src_prods = src.get("Products", [])
 prc_prods = prc.get("Products", [])
-src_groups = group_products_by_name(src_prods)
-prc_groups = group_products_by_name(prc_prods)
+
+# Group and de-duplicate identical regimens per drug
+src_groups_raw = group_products_by_name(src_prods)
+prc_groups_raw = group_products_by_name(prc_prods)
+src_groups = {k: _dedupe_regimens(v) for k, v in src_groups_raw.items()}
+prc_groups = {k: _dedupe_regimens(v) for k, v in prc_groups_raw.items()}
+
 all_name_keys = sorted(set(src_groups) | set(prc_groups))
 
 if not all_name_keys:
@@ -885,7 +953,7 @@ else:
     for name_key in all_name_keys:
         s_list = src_groups.get(name_key, [])
         p_list = prc_groups.get(name_key, [])
-        # Title from any non-empty name
+        # Title from any non-empty name (fallback to PID if truly nameless)
         title = ""
         for lst in (s_list, p_list):
             for rec in lst:
@@ -893,7 +961,15 @@ else:
                     title = rec["Drug"]; break
             if title: break
         if not title:
-            title = "(Unnamed drug)"
+            # Try PID hint
+            hint = ""
+            for lst in (s_list, p_list):
+                for rec in lst:
+                    if rec.get("_pid"):
+                        hint = rec["_pid"]; break
+                if hint: break
+            title = hint or "(Unnamed drug)"
+
         st.markdown(f'<div class="box"><h5>Drug: {title}</h5>', unsafe_allow_html=True)
 
         n_reg = max(len(s_list), len(p_list))
@@ -950,11 +1026,14 @@ def make_event_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title:
 if not all_evt_keys:
     st.markdown('<div class="box smallnote">No events found in either file.</div>', unsafe_allow_html=True)
 else:
+    # show union; keep source-first, then processed-only
+    shown = set()
     for key in all_evt_keys:
-        se = src_evt_idx.get(key, {"LLT Term": ""})
-        pe = prc_evt_idx.get(key, {"LLT Term": ""})
+        se = src_evt_idx.get(key, {})
+        pe = prc_evt_idx.get(key, {})
         title = se.get("LLT Term") or pe.get("LLT Term") or (se.get("LLT Code") or pe.get("LLT Code") or "(Unnamed event)")
         make_event_box_for_ui(se, pe, title)
+        shown.add(key)
 
 # ---------------- SECTION: Narrative ----------------
 st.subheader("Narrative")
@@ -1002,7 +1081,15 @@ for name_key in all_name_keys:
             if rec.get("Drug"):
                 title = rec["Drug"]; break
         if title: break
-    if not title: title = "(Unnamed drug)"
+    if not title:
+        hint = ""
+        for lst in (s_list, p_list):
+            for rec in lst:
+                if rec.get("_pid"):
+                    hint = rec["_pid"]; break
+            if hint: break
+        title = hint or "(Unnamed drug)"
+
     n_reg = max(len(s_list), len(p_list))
     for idx in range(n_reg):
         srec = s_list[idx] if idx < len(s_list) else {}
@@ -1014,7 +1101,7 @@ for name_key in all_name_keys:
             if has_value(s_val) or has_value(p_val):
                 drug_rows.append({"Section":"Drug", "Group": group_name, "Field": field, "Source": s_val or "—", "Processed": p_val or "—"})
 
-# Events sheet (flatten; include keys only in processed too)
+# Events sheet (flatten; include processed-only too)
 event_rows = []
 for key, se in src_evt_idx.items():
     pe = prc_evt_idx.get(key, {})
