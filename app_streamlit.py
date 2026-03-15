@@ -15,9 +15,9 @@ NS = {'hl7': 'urn:hl7-org:v3', 'xsi': 'http://www.w3.org/2001/XMLSchema-instance
 UNKNOWN_TOKENS = {"unk", "asku", "unknown"}
 
 # Admin identifiers
-SENDER_ID_OID = "2.16.840.1.113883.3.989.2.1.3.1"  # Sender ID
-WWID_OID = "2.16.840.1.113883.3.989.2.1.3.2"       # WWID
-FIRST_SENDER_OID = "2.16.840.1.113883.3.989.2.1.1.3"  # First sender of case (1=Regulator, 2=Other)
+SENDER_ID_OID = "2.16.840.1.113883.3.989.2.1.3.1"  
+WWID_OID = "2.16.840.1.113883.3.989.2.1.3.2"       
+FIRST_SENDER_OID = "2.16.840.1.113883.3.989.2.1.1.3"  
 FIRST_SENDER_MAP = {"1": "Regulator", "2": "Other"}
 
 # Reporter qualification OID
@@ -31,7 +31,7 @@ REPORTER_MAP = {
 }
 
 # Reporter SOURCE anchor OID
-REPORT_SOURCE_OID = "2.16.840.1.113883.3.989.2.1.1.22"  # displayName="sourceReport"
+REPORT_SOURCE_OID = "2.16.840.1.113883.3.989.2.1.1.22" 
 
 # Patient OIDs
 AGE_OID = "2.16.840.1.113883.3.989.2.1.1.19"
@@ -49,9 +49,9 @@ ACTION_TAKEN_MAP = {
 }
 
 # MedDRA / Clinical section OIDs
-MEDDRA_LLT_OID = "2.16.840.1.113883.6.163"  # LLT codes in observations
-MH_SECTION_OID = "2.16.840.1.113883.3.989.2.1.1.20"  # clinical sections (MH, Labs, etc.)
-STATUS_OID = "2.16.840.1.113883.3.989.2.1.1.19"  # includes 'causality'(39) & 'interventionCharacterization'(20)
+MEDDRA_LLT_OID = "2.16.840.1.113883.6.163"  
+MH_SECTION_OID = "2.16.840.1.113883.3.989.2.1.1.20"  
+STATUS_OID = "2.16.840.1.113883.3.989.2.1.1.19" 
 INTERVENTION_CHAR_CODE = "20"
 CAUSALITY_CODE = "39"
 
