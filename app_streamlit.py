@@ -866,7 +866,9 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
     title_vals, given_vals, family_val = [], [], ""
     if name_el is not None:
         for pfx in name_el.findall('hl7:prefix', NS):
-            v = read_text_or_mask(pfx);  if v: title_vals.append(v)
+            v = read_text_or_mask(pfx)
+            if v:
+                title_vals.append(v)
         for g in name_el.findall('hl7:given', NS):
             v = read_text_or_mask(g);    if v: given_vals.append(v)
         fam_el = name_el.find('hl7:family', NS)
