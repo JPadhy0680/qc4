@@ -1,4 +1,3 @@
-# qc_twofile_compare_tabular.py
 import streamlit as st
 import pandas as pd
 import xml.etree.ElementTree as ET
@@ -7,8 +6,8 @@ import io, re, calendar, zipfile
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 # ---------------- UI setup ----------------
-st.set_page_config(page_title="E2B_R3 Two-File Comparator (Tabular, Box‑wise)", layout="wide")
-st.title("🧪📄📄 E2B_R3 Two‑File Comparator — Tabular, Box‑wise")
+st.set_page_config(page_title="XML_R3 Comparator", layout="wide")
+st.title("📄XML_R3 Comparator📄")
 
 # Optional debug toggles (kept for other sections)
 DEBUG_EVENTS = st.sidebar.checkbox("Debug events parsing", value=False)
