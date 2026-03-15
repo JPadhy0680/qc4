@@ -1345,7 +1345,7 @@ if src.get("_error") or prc.get("_error"):
 # ==========================================================
 
 # 1) Admin / Header
-st.subheader("Admin / Header")
+st.subheader("Admin")
 admin_df = make_admin_table(src, prc)
 if not admin_df.empty:
     st.table(admin_df)
@@ -1353,7 +1353,7 @@ else:
     st.markdown('<div class="box smallnote">No header/admin values present.</div>', unsafe_allow_html=True)
 
 # 2) Reporters
-st.subheader("Reporters (paired sequentially)")
+st.subheader("Reporter")
 src_reps = src.get("Reporters", []) or []
 prc_reps = prc.get("Reporters", []) or []
 n_boxes = max(len(src_reps), len(prc_reps))
@@ -1370,14 +1370,14 @@ else:
         st.markdown('</div>', unsafe_allow_html=True)
 
 # 3) Patient and History
-st.subheader("Patient Details")
+st.subheader("Patient")
 pat_df = make_patient_table(src.get("Patient",{}), prc.get("Patient",{}))
 if not pat_df.empty:
     st.table(pat_df)
 else:
     st.markdown('<div class="box smallnote">No patient values present.</div>', unsafe_allow_html=True)
 
-st.subheader("Patient — Medical History (matched by LLT code; fallback: normalized term)")
+st.subheader("Medical History")
 src_mh = src.get("MedicalHistory", []) or []
 prc_mh = prc.get("MedicalHistory", []) or []
 def _idx_mh(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
@@ -1415,7 +1415,7 @@ else:
         make_mh_box_for_ui(se, pe, title)
 
 # 4) Drug
-st.subheader("Drug Details (all products) — matched by name → pid → gid")
+st.subheader("Drug")
 src_prods = src.get("Products", [])
 prc_prods = prc.get("Products", [])
 src_idx = index_by_match_key(src_prods)
@@ -1451,7 +1451,7 @@ else:
         st.markdown('</div>', unsafe_allow_html=True)
 
 # 5) Event
-st.subheader("Event Details — matched by LLT code (fallback: normalized term)")
+st.subheader("Event")
 src_evts = src.get("Events", []) or []
 prc_evts = prc.get("Events", []) or []
 def _idx_events(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
@@ -1491,7 +1491,7 @@ else:
         make_event_box_for_ui(se, pe, title)
 
 # 6) Lab
-st.subheader("Lab Details (matched by LLT code; fallback: normalized term)")
+st.subheader("Lab")
 src_lab = src.get("LabDetails", []) or []
 prc_lab = prc.get("LabDetails", []) or []
 def _idx_lab(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
@@ -1529,7 +1529,7 @@ else:
         make_lab_box_for_ui(se, pe, title)
 
 # 7) Narrative
-st.subheader("Narrative (full)")
+st.subheader("Narrative")
 src_narr_full = src.get("Narrative","") or ""
 prc_narr_full = prc.get("Narrative","") or ""
 if not has_value(src_narr_full) and not has_value(prc_narr_full):
@@ -1543,7 +1543,7 @@ else:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # 8) Causality — SINGLE CONSOLIDATED TABLE
-st.subheader("Causality (full list)")
+st.subheader("Causality")
 def _caus_df(lst: List[Dict[str,Any]]) -> pd.DataFrame:
     # Only the requested columns; Intervention/EventRef/ProductRef omitted
     if not lst:
