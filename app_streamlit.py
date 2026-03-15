@@ -33,11 +33,13 @@ REPORTER_MAP = {
     "5": "Consumer or other non-health professional",
 }
 
-# Reporter SOURCE anchor OID
+# Reporter SOURCE anchor OID (to locate reporter branches)
 REPORT_SOURCE_OID  = "2.16.840.1.113883.3.989.2.1.1.22"  # displayName="sourceReport"
 
-# Patient OIDs
+# Patient: Age observation OID
 AGE_OID            = "2.16.840.1.113883.3.989.2.1.1.19"
+
+# Patient: Record Number OID
 PATIENT_RECORD_OID = "2.16.840.1.113883.3.989.2.1.3.7"
 
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
@@ -141,7 +143,11 @@ def safe_disp(v: str) -> str:
     return v if v else "—"
 
 # ---- Generic patient observation resolver (displayName OR OID) ----
-def get_pq_value_by_code(root: ET.Element, display_name: Optional[str] = None, code_system_oid: Optional[str] = None) -> Tuple[str, str]:
+def get_pq_value_by_code(
+    root: ET.Element,
+    display_name: Optional[str] = None,
+    code_system_oid: Optional[str] = None
+) -> Tuple[str, str]:
     for obs in root.findall('.//hl7:observation', NS):
         code_el = obs.find('hl7:code', NS)
         if code_el is None:
@@ -252,12 +258,14 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
     if not (w_val or w_unit):
         for obs in root.findall('.//hl7:observation', NS):
             val = obs.find('hl7:value', NS)
-            if val is None: continue
+            if val is None: 
+                continue
             u = (val.attrib.get('unit') or '').strip().lower()
             if u in {'kg','lb','lbs'}:
                 w_val = (val.attrib.get('value') or '').strip()
                 w_unit = (val.attrib.get('unit') or '').strip()
-                if w_val: break
+                if w_val:
+                    break
     weight = ""
     if clean_value(w_val):
         weight = clean_value(w_val)
@@ -271,12 +279,14 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
     if not (h_val or h_unit):
         for obs in root.findall('.//hl7:observation', NS):
             val = obs.find('hl7:value', NS)
-            if val is None: continue
+            if val is None: 
+                continue
             u = (val.attrib.get('unit') or '').strip().lower()
             if u in {'cm','m','in'}:
                 h_val = (val.attrib.get('value') or '').strip()
                 h_unit = (val.attrib.get('unit') or '').strip()
-                if h_val: break
+                if h_val:
+                    break
     height = ""
     if clean_value(h_val):
         height = clean_value(h_val)
@@ -310,7 +320,7 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
         "Patient Record Number": clean_value(patient_record_no),
     }
 
-# ---------------- Products extraction (ALL; group by COMPONENT; NO REGIMEN) ----------------
+# ---------------- Products extraction (ALL; group by COMPONENT; NO REGIMENS) ----------------
 def extract_suspect_ids(root: ET.Element) -> Set[str]:
     out = set()
     for c in findall(root, './/hl7:causalityAssessment'):
@@ -835,13 +845,33 @@ def make_patient_table(src_pat: Dict[str,str], prc_pat: Dict[str,str]) -> pd.Dat
     rows = [(f, src_pat.get(f,""), prc_pat.get(f,"")) for f in fields]
     return compare_table(rows, treat_as_dates=False)
 
-# ------ Drug UI helpers (NO REGIMENS) ------
-def index_by_gid(products: List[Dict[str,Any]]) -> Dict[str, Dict[str,Any]]:
+# ------ Drug UI helpers (name/pid-matching; NO REGIMENS) ------
+def _drug_match_key(rec: Dict[str, Any]) -> str:
+    """
+    Build a stable matching key:
+      1) normalized 'Drug' title if present,
+      2) else product id (_pid),
+      3) else the group id (_gid) as last resort.
+    """
+    title = (rec.get("Drug") or "").strip()
+    if title:
+        return f"name::{normalize_text(title)}"
+    pid = (rec.get("_pid") or "").strip().lower()
+    if pid:
+        return f"pid::{pid}"
+    gid = (rec.get("_gid") or "").strip().lower()
+    return gid or "unknown"
+
+def index_by_match_key(products: List[Dict[str,Any]]) -> Dict[str, Dict[str,Any]]:
+    """
+    Index one-block-per-product by match key (Drug name → fallback pid → fallback gid).
+    If multiple blocks collapse to the same key, keep the first in encounter order.
+    """
     idx: Dict[str, Dict[str,Any]] = {}
     for rec in products:
-        gid = rec.get("_gid") or ""
-        if gid and gid not in idx:
-            idx[gid] = rec
+        key = _drug_match_key(rec)
+        if key and key not in idx:
+            idx[key] = rec
     return idx
 
 def make_drug_compare_table(src_rec: Dict[str,Any], prc_rec: Dict[str,Any]) -> pd.DataFrame:
@@ -923,32 +953,47 @@ else:
     st.markdown('<div class="box smallnote">No patient values present in either file.</div>', unsafe_allow_html=True)
 
 # ---------------- SECTION: Drug Details (ALL products; grouped by COMPONENT; NO REGIMENS) ----------------
-st.subheader("Drug Details (all products) — one block per component")
+st.subheader("Drug Details (all products) — matched by name → pid → gid")
 
 src_prods = src.get("Products", [])
 prc_prods = prc.get("Products", [])
 
-src_idx = index_by_gid(src_prods)
-prc_idx = index_by_gid(prc_prods)
+# Build name/pid-based indices
+src_idx = index_by_match_key(src_prods)
+prc_idx = index_by_match_key(prc_prods)
 
-# preserve order: src first in encounter order (as produced), then processed-only
-ordered_gids: List[str] = []
+# Preserve Source encounter order first, then Processed-only
+ordered_keys: List[str] = []
+seen_keys = set()
+
 for rec in src_prods:
-    g = rec.get("_gid")
-    if g and g not in ordered_gids:
-        ordered_gids.append(g)
-for rec in prc_prods:
-    g = rec.get("_gid")
-    if g and g not in ordered_gids:
-        ordered_gids.append(g)
+    k = _drug_match_key(rec)
+    if k and k not in seen_keys:
+        seen_keys.add(k)
+        ordered_keys.append(k)
 
-if not ordered_gids:
+for rec in prc_prods:
+    k = _drug_match_key(rec)
+    if k and k not in seen_keys:
+        seen_keys.add(k)
+        ordered_keys.append(k)
+
+if not ordered_keys:
     st.markdown('<div class="box smallnote">No products found in either file.</div>', unsafe_allow_html=True)
 else:
-    for gid in ordered_gids:
-        srec = src_idx.get(gid, {})
-        prec = prc_idx.get(gid, {})
-        title = srec.get("Drug") or prec.get("Drug") or (srec.get("_pid") or prec.get("_pid") or "(Unnamed drug)")
+    for key in ordered_keys:
+        srec = src_idx.get(key, {})
+        prec = prc_idx.get(key, {})
+
+        # Title for the box
+        title = (
+            (srec.get("Drug") or "").strip()
+            or (prec.get("Drug") or "").strip()
+            or (srec.get("_pid") or "").strip()
+            or (prec.get("_pid") or "").strip()
+            or "(Unnamed drug)"
+        )
+
         st.markdown(f'<div class="box"><h5>Drug: {title}</h5>', unsafe_allow_html=True)
         d_df = make_drug_compare_table(srec, prec)
         if d_df.empty:
@@ -1035,17 +1080,29 @@ for i in range(max(len(src_reps), len(prc_reps))):
     r_df = make_reporter_pair_table(srep, prep)
     reporter_rows += rows_from_table(r_df, "Reporter", group=title)
 
-# Drugs sheet (flatten — NO REGIMENS; one block per component)
+# --- Excel: Drugs sheet (name/pid-matched)
 drug_rows = []
-for gid in ordered_gids:
-    srec = src_idx.get(gid, {})
-    prec = prc_idx.get(gid, {})
-    group_title = srec.get("Drug") or prec.get("Drug") or (srec.get("_pid") or prec.get("_pid") or "(Unnamed drug)")
+for key in ordered_keys:
+    srec = src_idx.get(key, {})
+    prec = prc_idx.get(key, {})
+    group_title = (
+        (srec.get("Drug") or "").strip()
+        or (prec.get("Drug") or "").strip()
+        or (srec.get("_pid") or "").strip()
+        or (prec.get("_pid") or "").strip()
+        or "(Unnamed drug)"
+    )
     for field in ["Type","Dosage Text","Dose Value","Dose Unit","Start Date","Stop Date","Route","Formulation","Lot No","MAH"]:
         s_val = srec.get(field, "")
         p_val = prec.get(field, "")
         if has_value(s_val) or has_value(p_val):
-            drug_rows.append({"Section":"Drug", "Group": group_title, "Field": field, "Source": s_val or "—", "Processed": p_val or "—"})
+            drug_rows.append({
+                "Section":"Drug",
+                "Group": group_title,
+                "Field": field,
+                "Source": s_val or "—",
+                "Processed": p_val or "—"
+            })
 
 # Events sheet (flatten; include processed-only too)
 event_rows = []
