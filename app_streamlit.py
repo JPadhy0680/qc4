@@ -870,7 +870,9 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
             if v:
                 title_vals.append(v)
         for g in name_el.findall('hl7:given', NS):
-            v = read_text_or_mask(g);    if v: given_vals.append(v)
+            v = read_text_or_mask(g);    
+            if v: 
+                given_vals.append(v)
         fam_el = name_el.find('hl7:family', NS)
         family_val = read_text_or_mask(fam_el)
     result["Reporter Title"]         = "; ".join(title_vals) if title_vals else ""
