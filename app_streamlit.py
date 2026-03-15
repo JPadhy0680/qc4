@@ -39,6 +39,9 @@ REPORT_SOURCE_OID  = "2.16.840.1.113883.3.989.2.1.1.22"  # displayName="sourceRe
 # Patient: Age observation OID
 AGE_OID            = "2.16.840.1.113883.3.989.2.1.1.19"  # 'age' observation system
 
+# Patient: Record Number OID (new)
+PATIENT_RECORD_OID = "2.16.840.1.113883.3.989.2.1.3.7"
+
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
 TD_PATHS = [
     './/hl7:transmissionWrapper/hl7:creationTime',
@@ -163,6 +166,22 @@ def get_pq_value_by_code(
         u = (val_el.attrib.get('unit') or '').strip()
         return v, u
     return "", ""
+
+def find_mask_aware_id_by_root(root: ET.Element, oid: str) -> str:
+    """
+    Return an identifier's extension for the given OID anywhere in the doc.
+    If the id node has nullFlavor='MSK', return 'Masked'.
+    Otherwise prefer @extension (if present); else ''.
+    """
+    for el in root.iter():
+        if local_name(el.tag) != 'id':
+            continue
+        if el.attrib.get('root') == oid:
+            if el.attrib.get('nullFlavor') == 'MSK':
+                return "Masked"
+            ext = (el.attrib.get('extension') or '').strip()
+            return ext
+    return ""
 
 # ---------------- Admin extraction ----------------
 def extract_id_by_oid(root: ET.Element, oid: str) -> str:
@@ -297,6 +316,9 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
             if fam is not None and fam.text and fam.text.strip(): parts.append(fam.text.strip()[0].upper())
             initials = "".join(parts) or clean_value(get_text(nm))
 
+    # Patient Record Number (mask-aware)
+    patient_record_no = find_mask_aware_id_by_root(root, PATIENT_RECORD_OID)
+
     return {
         "Gender": clean_value(gender),
         "Age": clean_value(age),
@@ -304,6 +326,7 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
         "Height": clean_value(height),
         "Weight": clean_value(weight),
         "Initials": clean_value(initials),
+        "Patient Record Number": clean_value(patient_record_no),
     }
 
 # ---------------- Products extraction ----------------
@@ -356,7 +379,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
         id_elem = find_first(admin, './/hl7:id')
         pid = id_elem.attrib.get('root','') if id_elem is not None else ''
 
-        # Drug name (same paths as before)
+        # Drug name
         nm = find_first(admin, './/hl7:kindOfProduct/hl7:name')
         raw_name = ""
         if nm is not None:
@@ -380,7 +403,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
         sd_raw = (low.attrib.get('value') or '').strip() if low is not None else ''
         ed_raw = (high.attrib.get('value') or '').strip() if high is not None else ''
 
-        # Route (try originalText, then displayName)
+        # Route
         rtxt = get_text(find_first(admin, './/hl7:routeCode/hl7:originalText'))
         if not rtxt:
             rc = find_first(admin, './/hl7:routeCode')
@@ -422,8 +445,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
             "_pid": pid or "",
         })
 
-    # Assign regimen indices within each drug name group (order preserved)
-    grouped: Dict[str, int] = {}
+    # Regimen numbering within each drug group
     counts: Dict[str, int] = {}
     for rec in prods:
         key = rec.get("_name_key","") or rec.get("Drug","").lower()
@@ -479,6 +501,7 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
     result = {
         "Reporter Qualification": "",
         "Reporter IDs": "",
+        "Reporter Title": "",
         "Reporter Name (Full)": "",
         "Reporter Given Name(s)": "",
         "Reporter Family Name": "",
@@ -502,6 +525,7 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
         elif rt: ids.append(rt)
     if ids:
         result["Reporter IDs"] = "; ".join(dict.fromkeys(ids))
+
     # Qualification
     qual = ""
     for code_el in node.iter():
@@ -509,22 +533,31 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
             c = (code_el.attrib.get('code') or '').strip()
             qual = REPORTER_MAP.get(c, c); break
     result["Reporter Qualification"] = qual
-    # Name
+
+    # Name + Title (mask-aware)
     name_el = node.find('.//hl7:assignedPerson/hl7:name', NS) or node.find('.//hl7:name', NS)
-    given_vals, family_val = [], ""
+
+    title_vals, given_vals, family_val = [], [], ""
     if name_el is not None:
+        for pfx in name_el.findall('hl7:prefix', NS):
+            v = read_text_or_mask(pfx)
+            if v: title_vals.append(v)
         for g in name_el.findall('hl7:given', NS):
             v = read_text_or_mask(g)
             if v: given_vals.append(v)
         fam_el = name_el.find('hl7:family', NS)
         family_val = read_text_or_mask(fam_el)
+
     parts = [p for p in given_vals if p] + ([family_val] if family_val else [])
     full_name = " ".join(parts).strip()
     if not full_name and name_el is not None and any(ch.attrib.get('nullFlavor') == 'MSK' for ch in name_el):
         full_name = "Masked"
+
+    result["Reporter Title"]         = "; ".join(title_vals) if title_vals else ""
     result["Reporter Name (Full)"]   = full_name
     result["Reporter Given Name(s)"] = "; ".join(given_vals) if given_vals else ""
     result["Reporter Family Name"]   = family_val
+
     # Organization
     for xp in [
         './/hl7:assignedEntity/hl7:representedOrganization/hl7:name',
@@ -537,6 +570,7 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
             if txt:
                 result["Reporter Organization"] = txt
                 break
+
     # Address
     addr = node.find('.//hl7:addr', NS)
     streets, city, state, postal, country = [], "", "", "", ""
@@ -557,6 +591,7 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
     result["Reporter State/Province"] = state
     result["Reporter Postal Code"]    = postal
     result["Reporter Country"]        = country
+
     # Telecoms
     phones, emails, faxes = [], [], []
     for tel in node.findall('.//hl7:telecom', NS):
@@ -641,11 +676,13 @@ def extract_events(root: ET.Element, debug: bool = False) -> List[Dict[str, Any]
                 outcome_el = rxn.find('.//hl7:code[@displayName="outcome"]/../hl7:value', NS)
                 outcome_code = (outcome_el.attrib.get('code') or '').strip() if outcome_el is not None else ''
                 outcome = outcome_map.get(outcome_code, "Unknown" if outcome_code else "")
+
                 low = rxn.find('.//hl7:effectiveTime/hl7:low', NS)
                 high = rxn.find('.//hl7:effectiveTime/hl7:high', NS)
                 start_raw = (low.attrib.get('value') or '').strip() if low is not None else ''
                 end_raw = (high.attrib.get('value') or '').strip() if high is not None else ''
                 start_disp = format_date(start_raw); end_disp = format_date(end_raw)
+
                 out.append({
                     "LLT Code": clean_value(llt_code),
                     "LLT Term": clean_value(llt_term),
@@ -661,7 +698,8 @@ def extract_events(root: ET.Element, debug: bool = False) -> List[Dict[str, Any]
             st.warning("Event parsing warnings:\n- " + "\n- ".join(debug_rows))
         return out
     except Exception as e:
-        if debug: st.exception(e)
+        if debug:
+            st.exception(e)
         return out
 
 # ---------------- Narrative extraction ----------------
@@ -682,7 +720,7 @@ def extract_model(xml_bytes: bytes, debug_events: bool = False) -> Dict[str, Any
     model.update(extract_td_frd_lrd(root))
     model["Reporters"] = extract_reporters_from_sourceReport(root)
     model["Patient"] = extract_patient(root)
-    model["Products"] = extract_all_products(root)   # << All drugs with types + regimens
+    model["Products"] = extract_all_products(root)   # ALL drugs with types + regimens
     model["Events"] = extract_events(root, debug=debug_events)
     model["Narrative"] = extract_narrative(root)
     return model
@@ -719,6 +757,7 @@ def make_reporter_pair_table(src_rep: Dict[str,str], prc_rep: Dict[str,str]) -> 
     fields = [
         "Reporter Qualification",
         "Reporter IDs",
+        "Reporter Title",          # NEW
         "Reporter Name (Full)",
         "Reporter Given Name(s)",
         "Reporter Family Name",
@@ -736,7 +775,7 @@ def make_reporter_pair_table(src_rep: Dict[str,str], prc_rep: Dict[str,str]) -> 
     return compare_table(rows, treat_as_dates=False)
 
 def make_patient_table(src_pat: Dict[str,str], prc_pat: Dict[str,str]) -> pd.DataFrame:
-    fields = ["Gender","Age","Age Group","Height","Weight","Initials"]
+    fields = ["Gender","Age","Age Group","Height","Weight","Initials","Patient Record Number"]
     rows = [(f, src_pat.get(f,""), prc_pat.get(f,"")) for f in fields]
     return compare_table(rows, treat_as_dates=False)
 
@@ -749,7 +788,6 @@ def group_products_by_name(products: List[Dict[str,Any]]) -> Dict[str, List[Dict
     return groups
 
 def make_regimen_pair_table(src_rec: Dict[str,Any], prc_rec: Dict[str,Any]) -> pd.DataFrame:
-    # For each regimen, compare the following fields (add Type, Route)
     fields = [
         "Type",
         "Dosage Text",
@@ -766,7 +804,6 @@ def make_regimen_pair_table(src_rec: Dict[str,Any], prc_rec: Dict[str,Any]) -> p
     for field in fields:
         s_val = src_rec.get(field, "")
         p_val = prc_rec.get(field, "")
-        # date fallback from raw if missing
         if "Date" in field:
             s_val = s_val or format_date(src_rec.get(field + " (raw)", ""))
             p_val = p_val or format_date(prc_rec.get(field + " (raw)", ""))
@@ -977,8 +1014,7 @@ for name_key in all_name_keys:
             if has_value(s_val) or has_value(p_val):
                 drug_rows.append({"Section":"Drug", "Group": group_name, "Field": field, "Source": s_val or "—", "Processed": p_val or "—"})
 
-# Events sheet (flatten)
-# (same as before)
+# Events sheet (flatten; include keys only in processed too)
 event_rows = []
 for key, se in src_evt_idx.items():
     pe = prc_evt_idx.get(key, {})
