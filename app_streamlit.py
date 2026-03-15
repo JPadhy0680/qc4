@@ -1551,11 +1551,11 @@ def _caus_df(lst: List[Dict[str,Any]]) -> pd.DataFrame:
     rows = []
     for r in lst:
         rows.append({
-            "Assessor": r.get("Assessor",""),
-            "Assessment": r.get("Assessment",""),
-            "Method": r.get("Method",""),
-            "Reaction": r.get("Reaction",""),
             "Drug": r.get("Drug",""),
+            "Reaction": r.get("Reaction",""),
+            "Assessor": r.get("Assessor",""),
+            "Method": r.get("Method",""),
+            "Assessment": r.get("Assessment",""),
         })
     return pd.DataFrame(rows)
 
