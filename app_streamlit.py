@@ -1,3 +1,4 @@
+# qc_twofile_compare_tabular.py
 import streamlit as st
 import pandas as pd
 import xml.etree.ElementTree as ET
@@ -6,14 +7,8 @@ import io, re, calendar, zipfile
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 # ---------------- UI setup ----------------
-st.set_page_config(page_title="XML_R3 Comparator", layout="wide")
+st.set_page_config(page_title="📄XML_R3 Comparator📄", layout="wide")
 st.title("📄XML_R3 Comparator📄")
-
-# Optional debug toggles (kept for other sections)
-DEBUG_EVENTS = st.sidebar.checkbox("Debug events parsing", value=False)
-DEBUG_MH = st.sidebar.checkbox("Debug medical history parsing", value=False)
-DEBUG_LAB = st.sidebar.checkbox("Debug lab parsing", value=False)
-DEBUG_CAUS = st.sidebar.checkbox("Debug causality parsing", value=False)
 
 # ---------------- Utilities ----------------
 NS = {'hl7': 'urn:hl7-org:v3', 'xsi': 'http://www.w3.org/2001/XMLSchema-instance'}
@@ -321,6 +316,7 @@ def extract_first_sender_type(root: ET.Element) -> str:
 
 def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
     out = {"TD_raw":"", "TD":"", "FRD_raw":"", "FRD":"", "LRD_raw":"", "LRD":""}
+    # TD
     for p in TD_PATHS:
         e = find_first(root, p)
         if e is not None:
@@ -328,11 +324,13 @@ def extract_td_frd_lrd(root: ET.Element) -> Dict[str, str]:
             if val:
                 out["TD_raw"] = val; out["TD"] = format_date(val)
                 break
+    # LRD
     for el in root.iter():
         if local_name(el.tag) == 'availabilityTime':
             v = el.attrib.get('value')
             if v:
                 out["LRD_raw"] = v; out["LRD"] = format_date(v); break
+    # FRD (earliest <low>)
     lows = []
     for el in root.iter():
         if local_name(el.tag) == 'low':
@@ -378,10 +376,12 @@ def find_mask_aware_id_by_root(root: ET.Element, oid: str) -> str:
     return ""
 
 def extract_patient(root: ET.Element) -> Dict[str, str]:
+    # Gender
     gender_elem = find_first(root, './/hl7:administrativeGenderCode')
     gender_code = gender_elem.attrib.get('code', '') if gender_elem is not None else ''
     gender = clean_value(map_gender(gender_code))
 
+    # Age
     age_val, age_unit_raw = get_pq_value_by_code(root, display_name="age", code_system_oid=AGE_OID)
     unit_map = {'a': 'year', 'b': 'month'}
     age_unit_label = unit_map.get((age_unit_raw or '').lower(), age_unit_raw or '')
@@ -391,6 +391,7 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
         if clean_value(age_unit_label):
             age = f"{age} {age_unit_label}"
 
+    # Age Group
     age_group_map = {"0":"Foetus","1":"Neonate","2":"Infant","3":"Child","4":"Adolescent","5":"Adult","6":"Elderly"}
     ag_elem = find_first(root, './/hl7:code[@displayName="ageGroup"]/../hl7:value')
     age_group = ""
@@ -497,7 +498,7 @@ def build_reaction_id_to_term(root: ET.Element, meddra_map: Optional[Dict[str, D
     return out
 
 # ---------------- Medical History extraction ----------------
-def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]] = None, debug: bool = False) -> List[Dict[str, Any]]:
+def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]] = None) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     pmap = build_parent_map(root)
     anchors: List[ET.Element] = []
@@ -564,12 +565,10 @@ def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dic
                 "End Date": ed,
                 "_key": key,
             })
-    if debug and not items:
-        st.info("No medical history items parsed from expected section.")
     return items
 
 # ---------------- Lab Details extraction ----------------
-def extract_labs(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]] = None, debug: bool = False) -> List[Dict[str, Any]]:
+def extract_labs(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]] = None) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     pmap = build_parent_map(root)
     anchors: List[ET.Element] = []
@@ -645,8 +644,6 @@ def extract_labs(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]
                 "More Info Available": clean_value(more_info),
                 "_key": key,
             })
-    if debug and not items:
-        st.info("No lab details parsed from expected section.")
     return items
 
 # ---------------- Causality extraction (relaxed + improved assessor) ----------------
@@ -695,8 +692,7 @@ def _extract_assessor_label(node: ET.Element) -> str:
 def extract_causality(
     root: ET.Element,
     product_id_to_name: Optional[Dict[str, str]] = None,
-    reaction_id_to_term: Optional[Dict[str, str]] = None,
-    debug: bool = False
+    reaction_id_to_term: Optional[Dict[str, str]] = None
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     try:
@@ -711,7 +707,7 @@ def extract_causality(
                 dsn = (ccode.attrib.get('displayName') or '').strip().lower()
                 if cs != STATUS_OID: continue
 
-                # Intervention sentinel
+                # Intervention sentinel (tracked but not displayed)
                 if dsn == 'interventioncharacterization' or cd == INTERVENTION_CHAR_CODE:
                     current_intervention = _resolve_intervention_label(find_first(node, './/hl7:value'))
                     continue
@@ -750,7 +746,7 @@ def extract_causality(
                         if nm_txt:
                             drug_name = nm_txt
 
-                # Pairing key (kept internal; not shown)
+                # Pairing key (internal only)
                 key = (evt_id or "") + "::" + (prd_id or "")
                 if not key.strip(":"):
                     key = "assess::" + normalize_text(assessment or "") + "::" + normalize_text(method or "") + "::" + normalize_text(current_intervention or "")
@@ -766,8 +762,7 @@ def extract_causality(
                     "_prd_id": prd_id,
                 })
     except Exception as e:
-        if debug:
-            st.warning(f"Causality parse error: {e}")
+        st.warning(f"Causality parse error: {e}")
     return out
 
 # ---------------- Products extraction (ALL; grouped by COMPONENT) ----------------
@@ -1120,7 +1115,7 @@ def extract_reporters_from_sourceReport(root: ET.Element) -> List[Dict[str, str]
     return reporters
 
 # ---------------- Events extraction ----------------
-def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]] = None, debug: bool = False) -> List[Dict[str, Any]]:
+def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]] = None) -> List[Dict[str, Any]]:
     seriousness_map = {
         "resultsInDeath": "Death",
         "isLifeThreatening": "LT",
@@ -1148,6 +1143,7 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str
             val_el = rxn.find('hl7:value', NS)
             llt_code = (val_el.attrib.get('code') or '').strip() if val_el is not None else ''
 
+            # Decode MedDRA if available
             llt_term, pt_code, pt_term = "", "", ""
             if meddra_map and llt_code in meddra_map:
                 m = meddra_map[llt_code]
@@ -1161,6 +1157,7 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str
                 if ot is not None and (ot.text or '').strip():
                     llt_term = ot.text.strip()
 
+            # Seriousness flags
             flags: List[str] = []
             for crit, label in seriousness_map.items():
                 crit_el = rxn.find(f'.//hl7:code[@displayName="{crit}"]/../hl7:value', NS)
@@ -1168,10 +1165,12 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str
                     flags.append(label)
             seriousness_disp = "Non-serious" if not flags else ", ".join(sorted(set(flags)))
 
+            # Outcome
             outcome_el = rxn.find('.//hl7:code[@displayName="outcome"]/../hl7:value', NS)
             outcome_code = (outcome_el.attrib.get('code') or '').strip() if outcome_el is not None else ''
             outcome = outcome_map.get(outcome_code, "Unknown" if outcome_code else "")
 
+            # Dates
             low = rxn.find('.//hl7:effectiveTime/hl7:low', NS)
             high= rxn.find('.//hl7:effectiveTime/hl7:high', NS)
             start_raw = (low.attrib.get('value') or '').strip() if low is not None else ''
@@ -1181,12 +1180,13 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str
 
             key = clean_value(llt_code) or normalize_text(llt_term)
             if not key: continue
+
             out.append({
                 "LLT Code": clean_value(llt_code),
                 "LLT Term": clean_value(llt_term),
                 "PT Code": clean_value(pt_code),
                 "PT Term": clean_value(pt_term),
-                "Seriousness": clean_value(seriousness_disp),
+                "Seriousness": seriousness_disp,
                 "Outcome": clean_value(outcome),
                 "Event Start (raw)": start_raw,
                 "Event Start": start_disp,
@@ -1196,8 +1196,7 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str
             })
         return out
     except Exception as e:
-        if debug:
-            st.warning(f"Events parse error: {e}")
+        st.warning(f"Events parse error: {e}")
         return out
 
 # ---------------- Narrative extraction ----------------
@@ -1207,8 +1206,7 @@ def extract_narrative(root: ET.Element) -> str:
     return clean_value(txt)
 
 # ---------------- Model builder ----------------
-def extract_model(xml_bytes: bytes, meddra_map: Optional[Dict[str, Dict[str,str]]] = None,
-                  debug_events: bool = False, debug_mh: bool = False, debug_lab: bool = False, debug_caus: bool = False) -> Dict[str, Any]:
+def extract_model(xml_bytes: bytes, meddra_map: Optional[Dict[str, Dict[str,str]]] = None) -> Dict[str, Any]:
     try:
         root = ET.fromstring(xml_bytes)
     except Exception as e:
@@ -1223,13 +1221,13 @@ def extract_model(xml_bytes: bytes, meddra_map: Optional[Dict[str, Dict[str,str]
     model["Reporters"] = extract_reporters_from_sourceReport(root)
     model["Patient"] = extract_patient(root)
 
-    model["MedicalHistory"] = extract_medical_history(root, meddra_map=meddra_map, debug=debug_mh)
-    model["LabDetails"] = extract_labs(root, meddra_map=meddra_map, debug=debug_lab)
+    model["MedicalHistory"] = extract_medical_history(root, meddra_map=meddra_map)
+    model["LabDetails"] = extract_labs(root, meddra_map=meddra_map)
 
     products = extract_all_products(root)
     model["Products"] = products
 
-    model["Events"] = extract_events(root, meddra_map=meddra_map, debug=debug_events)
+    model["Events"] = extract_events(root, meddra_map=meddra_map)
 
     product_id_to_name = { (p.get("_pid") or "").strip(): (p.get("Drug") or "").strip()
                            for p in products if (p.get("_pid") or "").strip() }
@@ -1238,8 +1236,7 @@ def extract_model(xml_bytes: bytes, meddra_map: Optional[Dict[str, Dict[str,str]
     model["Causality"] = extract_causality(
         root,
         product_id_to_name=product_id_to_name,
-        reaction_id_to_term=reaction_id_to_term,
-        debug=debug_caus
+        reaction_id_to_term=reaction_id_to_term
     )
 
     model["Narrative"] = extract_narrative(root)
@@ -1335,11 +1332,9 @@ src_bytes = src_file.read()
 prc_bytes = prc_file.read()
 
 with st.spinner("Parsing Source..."):
-    src = extract_model(src_bytes, meddra_map=meddra_map,
-                        debug_events=DEBUG_EVENTS, debug_mh=DEBUG_MH, debug_lab=DEBUG_LAB, debug_caus=DEBUG_CAUS)
+    src = extract_model(src_bytes, meddra_map=meddra_map)
 with st.spinner("Parsing Processed..."):
-    prc = extract_model(prc_bytes, meddra_map=meddra_map,
-                        debug_events=DEBUG_EVENTS, debug_mh=DEBUG_MH, debug_lab=DEBUG_LAB, debug_caus=DEBUG_CAUS)
+    prc = extract_model(prc_bytes, meddra_map=meddra_map)
 
 if src.get("_error") or prc.get("_error"):
     st.error(f"Source error: {src.get('_error','-')}\nProcessed error: {prc.get('_error','-')}")
@@ -1547,7 +1542,7 @@ else:
     st.markdown(f'<div class="prewrap">{prc_narr_full if prc_narr_full else "—"}</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# 8) Causality — SINGLE CONSOLIDATED TABLE (requested)
+# 8) Causality — SINGLE CONSOLIDATED TABLE
 st.subheader("Causality (full list)")
 def _caus_df(lst: List[Dict[str,Any]]) -> pd.DataFrame:
     # Only the requested columns; Intervention/EventRef/ProductRef omitted
