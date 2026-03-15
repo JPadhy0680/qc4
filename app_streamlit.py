@@ -10,8 +10,9 @@ from typing import Optional, Dict, Any, List, Tuple, Set
 st.set_page_config(page_title="E2B_R3 Two-File Comparator (Tabular, Box-wise)", layout="wide")
 st.title("🧪📄📄 E2B_R3 Two‑File Comparator — Tabular, Box‑wise")
 
-# Optional debug control (Events parsing warnings)
+# Optional debug control (Events / MH parsing warnings)
 DEBUG_EVENTS = st.sidebar.checkbox("Debug events parsing", value=False)
+DEBUG_MH = st.sidebar.checkbox("Debug medical history parsing", value=False)
 
 # ---------------- Utilities ----------------
 NS = {'hl7': 'urn:hl7-org:v3', 'xsi': 'http://www.w3.org/2001/XMLSchema-instance'}
@@ -52,6 +53,9 @@ ACTION_TAKEN_MAP = {
     "0": "Unknown",
     "9": "Not applicable",
 }
+
+# MedDRA OIDs
+MEDDRA_LLT_OID = "2.16.840.1.113883.6.163"  # used for LLT codes in observations
 
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
 TD_PATHS = [
@@ -152,6 +156,43 @@ def has_value(x: str) -> bool:
 
 def safe_disp(v: str) -> str:
     return v if v else "—"
+
+# ---- MedDRA mapping loader ----
+def load_meddra_mapping(xlsx_file) -> Dict[str, Dict[str, str]]:
+    """
+    Reads an Excel with columns (case-insensitive):
+      'LLT Code', 'LLT Term', 'PT Code', 'PT Term'
+    Returns { llt_code_str : {'LLT Term':..., 'PT Code':..., 'PT Term':...} }
+    """
+    if not xlsx_file:
+        return {}
+    try:
+        df = pd.read_excel(xlsx_file, engine="openpyxl")
+    except Exception as e:
+        st.warning(f"Failed to read MedDRA mapping: {e}")
+        return {}
+    cols = {c.strip().lower(): c for c in df.columns}
+    required = ['llt code', 'llt term', 'pt code', 'pt term']
+    if not all(c in cols for c in required):
+        st.warning("MedDRA mapping file must include columns: LLT Code, LLT Term, PT Code, PT Term (case-insensitive).")
+        return {}
+    # Normalize into strings
+    map_dict: Dict[str, Dict[str, str]] = {}
+    for _, row in df.iterrows():
+        try:
+            llt_code = str(row[cols['llt code']]).strip()
+            if not llt_code or llt_code.lower() in {"nan", "none"}:
+                continue
+            llt_term = str(row[cols['llt term']]).strip() if pd.notna(row[cols['llt term']]) else ""
+            pt_code  = str(row[cols['pt code']]).strip()  if pd.notna(row[cols['pt code']])  else ""
+            pt_term  = str(row[cols['pt term']]).strip()  if pd.notna(row[cols['pt term']])  else ""
+            if llt_code not in map_dict:
+                map_dict[llt_code] = {"LLT Term": llt_term, "PT Code": pt_code, "PT Term": pt_term}
+        except Exception:
+            continue
+    if map_dict:
+        st.success(f"MedDRA mapping loaded — {len(map_dict):,} LLT rows")
+    return map_dict
 
 # ---- Generic patient observation resolver (displayName OR OID) ----
 def get_pq_value_by_code(
@@ -335,7 +376,7 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
 def build_parent_map(root: ET.Element) -> Dict[ET.Element, ET.Element]:
     return {c: p for p in root.iter() for c in list(p)}
 
-def extract_medical_history(root: ET.Element) -> List[Dict[str, Any]]:
+def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]] = None, debug: bool = False) -> List[Dict[str, Any]]:
     """
     Extracts 'Relevant Medical History and Concurrent Conditions' entries.
     Anchor: <code code="1" codeSystem="2.16.840.1.113883.3.989.2.1.1.20" ... displayName="relevantMedicalHistoryAndConcurrentConditions"/>
@@ -343,13 +384,14 @@ def extract_medical_history(root: ET.Element) -> List[Dict[str, Any]]:
       - observation (OBS/EVN) with MedDRA codeSystem 2.16.840.1.113883.6.163 -> LLT code/term
       - status from inboundRelationship/observation where codeSystem=2.16.840.1.113883.3.989.2.1.1.19 and BL true
       - effectiveTime low/high -> Start/End
+      - decode LLT -> (LLT Term / PT Code / PT Term) via meddra_map
     """
     MH_OID = "2.16.840.1.113883.3.989.2.1.1.20"
-    MEDDRA_OID = "2.16.840.1.113883.6.163"
     STATUS_OID = "2.16.840.1.113883.3.989.2.1.1.19"
 
     items: List[Dict[str, Any]] = []
     pmap = build_parent_map(root)
+    warnings: List[str] = []
 
     # Find anchors for the section
     anchors: List[ET.Element] = []
@@ -361,26 +403,34 @@ def extract_medical_history(root: ET.Element) -> List[Dict[str, Any]]:
         if c == "1" or disp == "relevantmedicalhistoryandconcurrentconditions":
             anchors.append(code)
 
-    # For each anchor, search in its parent subtree for MH observations
     for anc in anchors:
-        container = pmap.get(anc, None)
-        if container is None:
-            container = root  # fallback
+        container = pmap.get(anc, None) or root
 
-        # All OBS/EVN under this container
         for obs in container.findall('.//hl7:observation[@classCode="OBS"][@moodCode="EVN"]', NS):
             code = obs.find('hl7:code', NS)
             if code is None:
                 continue
-            if (code.attrib.get('codeSystem') or '').strip() != MEDDRA_OID:
-                continue  # only MedDRA-coded MH entries
+            if (code.attrib.get('codeSystem') or '').strip() != MEDDRA_LLT_OID:
+                continue
 
             llt_code = (code.attrib.get('code') or '').strip()
-            llt_term = (code.attrib.get('displayName') or '').strip()
+            # prefer mapping for LLT term/PTs
+            llt_term = ""
+            pt_code = ""
+            pt_term = ""
+
+            if meddra_map and llt_code in meddra_map:
+                m = meddra_map[llt_code]
+                llt_term = (m.get("LLT Term") or "").strip()
+                pt_code  = (m.get("PT Code") or "").strip()
+                pt_term  = (m.get("PT Term") or "").strip()
+
             if not llt_term:
-                ot = code.find('hl7:originalText', NS)
-                if ot is not None and (ot.text or '').strip():
-                    llt_term = ot.text.strip()
+                llt_term = (code.attrib.get('displayName') or '').strip()
+                if not llt_term:
+                    ot = code.find('hl7:originalText', NS)
+                    if ot is not None and (ot.text or '').strip():
+                        llt_term = ot.text.strip()
 
             # status from inboundRelationship OBS/EVN with STATUS_OID, BL true
             statuses: List[str] = []
@@ -408,6 +458,8 @@ def extract_medical_history(root: ET.Element) -> List[Dict[str, Any]]:
             items.append({
                 "LLT Code": clean_value(llt_code),
                 "LLT Term": clean_value(llt_term),
+                "PT Code": clean_value(pt_code),
+                "PT Term": clean_value(pt_term),
                 "Status": ", ".join(statuses) if statuses else "",
                 "Start Date (raw)": sd_raw,
                 "Start Date": sd,
@@ -416,6 +468,8 @@ def extract_medical_history(root: ET.Element) -> List[Dict[str, Any]]:
                 "_key": key,
             })
 
+    if debug and warnings:
+        st.warning("Medical history parsing warnings:\n- " + "\n- ".join(warnings))
     return items
 
 # ---------------- Products extraction (ALL; group by COMPONENT; NO REGIMENS) ----------------
@@ -478,10 +532,6 @@ def _resolve_drug_name(admin: ET.Element) -> str:
     return ""
 
 def _iter_drug_components(root: ET.Element) -> List[ET.Element]:
-    """
-    Return all <component typeCode="COMP"> elements that contain at least one
-    <substanceAdministration classCode="SBADM" moodCode="EVN"> anywhere inside.
-    """
     comps = []
     for comp in root.findall('.//hl7:component[@typeCode="COMP"]', NS):
         sas = comp.findall('.//hl7:substanceAdministration[@classCode="SBADM"][@moodCode="EVN"]', NS)
@@ -504,7 +554,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
       - Title = first resolvable product name; else pid; else comp::<seq>.
       - Fields with multiple values are joined by newline.
       - Action Taken collected from <act ACT/EVN><code codeSystem=ACTION_TAKEN_OID>.
-      - Drug Obtain Country captured from any <country>GB</country> (or other codes) within the component.
+      - Drug Obtain Country captured from any <country>…</country> within the component.
     """
     suspects   = extract_suspect_ids(root)
     interact   = extract_interacting_ids(root)
@@ -518,7 +568,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
         if not sas:
             continue
 
-        # FIRST pid in this component
+        # FIRST pid
         pid = ""
         for sa in sas:
             id_el = find_first(sa, './/hl7:id')
@@ -555,7 +605,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
             "Lot No": [],
             "MAH": [],
             "Action Taken": [],
-            "Drug Obtain Country": [],   # <-- NEW
+            "Drug Obtain Country": [],
         }
 
         for sa in sas:
@@ -628,7 +678,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
             "Lot No":       join_vals(agg["Lot No"]),
             "MAH":          join_vals(agg["MAH"]),
             "Action Taken": join_vals(agg["Action Taken"]),
-            "Drug Obtain Country": join_vals(agg["Drug Obtain Country"]),  # <-- NEW
+            "Drug Obtain Country": join_vals(agg["Drug Obtain Country"]),
             "_gid": f"pid::{pid.lower()}" if pid else f"comp::{cidx:03d}",
             "_pid": pid or "",
         })
@@ -797,8 +847,8 @@ def extract_reporters_from_sourceReport(root: ET.Element) -> List[Dict[str, str]
             reporters.append(rep)  # sequential; no matching
     return reporters
 
-# ---------------- Events extraction (aligned with app.py logic) ----------------
-def extract_events(root: ET.Element, debug: bool = False) -> List[Dict[str, Any]]:
+# ---------------- Events extraction (aligned with app.py logic + MedDRA decode) ----------------
+def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]] = None, debug: bool = False) -> List[Dict[str, Any]]:
     seriousness_map = {
         "resultsInDeath": "Death",
         "isLifeThreatening": "LT",
@@ -829,12 +879,25 @@ def extract_events(root: ET.Element, debug: bool = False) -> List[Dict[str, Any]
 
                 val_el = rxn.find('hl7:value', NS)
                 llt_code = (val_el.attrib.get('code') or '').strip() if val_el is not None else ''
-                llt_term = (val_el.attrib.get('displayName') or '').strip() if val_el is not None else ''
-                if not llt_term and val_el is not None:
-                    ot = val_el.find('hl7:originalText', NS)
-                    if ot is not None and (ot.text or '').strip():
-                        llt_term = ot.text.strip()
 
+                # Decode via MedDRA mapping if available
+                llt_term = ""
+                pt_code = ""
+                pt_term = ""
+                if meddra_map and llt_code in meddra_map:
+                    m = meddra_map[llt_code]
+                    llt_term = (m.get("LLT Term") or "").strip()
+                    pt_code  = (m.get("PT Code") or "").strip()
+                    pt_term  = (m.get("PT Term") or "").strip()
+                # fallback to displayName if LLT Term still empty
+                if not llt_term and val_el is not None:
+                    llt_term = (val_el.attrib.get('displayName') or '').strip()
+                    if not llt_term:
+                        ot = val_el.find('hl7:originalText', NS)
+                        if ot is not None and (ot.text or '').strip():
+                            llt_term = ot.text.strip()
+
+                # Seriousness flags
                 flags: List[str] = []
                 for crit, label in seriousness_map.items():
                     crit_el = rxn.find(f'.//hl7:code[@displayName="{crit}"]/../hl7:value', NS)
@@ -842,10 +905,12 @@ def extract_events(root: ET.Element, debug: bool = False) -> List[Dict[str, Any]
                         flags.append(label)
                 seriousness_disp = "Non-serious" if not flags else ", ".join(sorted(set(flags)))
 
+                # Outcome
                 outcome_el = rxn.find('.//hl7:code[@displayName="outcome"]/../hl7:value', NS)
                 outcome_code = (outcome_el.attrib.get('code') or '').strip() if outcome_el is not None else ''
                 outcome = outcome_map.get(outcome_code, "Unknown" if outcome_code else "")
 
+                # Event dates
                 low = rxn.find('.//hl7:effectiveTime/hl7:low', NS)
                 high = rxn.find('.//hl7:effectiveTime/hl7:high', NS)
                 start_raw = (low.attrib.get('value') or '').strip() if low is not None else ''
@@ -860,6 +925,8 @@ def extract_events(root: ET.Element, debug: bool = False) -> List[Dict[str, Any]
                 out.append({
                     "LLT Code": clean_value(llt_code),
                     "LLT Term": clean_value(llt_term),
+                    "PT Code": clean_value(pt_code),
+                    "PT Term": clean_value(pt_term),
                     "Seriousness": seriousness_disp,
                     "Outcome": clean_value(outcome),
                     "Event Start (raw)": start_raw,
@@ -889,7 +956,8 @@ def extract_narrative(root: ET.Element) -> str:
     return clean_value(narrative_elem.text if narrative_elem is not None else '')
 
 # ---------------- Model builder ----------------
-def extract_model(xml_bytes: bytes, debug_events: bool = False) -> Dict[str, Any]:
+def extract_model(xml_bytes: bytes, meddra_map: Optional[Dict[str, Dict[str,str]]] = None,
+                  debug_events: bool = False, debug_mh: bool = False) -> Dict[str, Any]:
     try:
         root = ET.fromstring(xml_bytes)
     except Exception as e:
@@ -901,9 +969,9 @@ def extract_model(xml_bytes: bytes, debug_events: bool = False) -> Dict[str, Any
     model.update(extract_td_frd_lrd(root))
     model["Reporters"] = extract_reporters_from_sourceReport(root)
     model["Patient"] = extract_patient(root)
-    model["MedicalHistory"] = extract_medical_history(root)    # <-- NEW
+    model["MedicalHistory"] = extract_medical_history(root, meddra_map=meddra_map, debug=debug_mh)
     model["Products"] = extract_all_products(root)
-    model["Events"] = extract_events(root, debug=debug_events)
+    model["Events"] = extract_events(root, meddra_map=meddra_map, debug=debug_events)
     model["Narrative"] = extract_narrative(root)
     return model
 
@@ -962,12 +1030,6 @@ def make_patient_table(src_pat: Dict[str,str], prc_pat: Dict[str,str]) -> pd.Dat
 
 # ------ Drug UI helpers (name/pid-matching; NO REGIMENS) ------
 def _drug_match_key(rec: Dict[str, Any]) -> str:
-    """
-    Build a stable matching key:
-      1) normalized 'Drug' title if present,
-      2) else product id (_pid),
-      3) else the group id (_gid) as last resort.
-    """
     title = (rec.get("Drug") or "").strip()
     if title:
         return f"name::{normalize_text(title)}"
@@ -978,10 +1040,6 @@ def _drug_match_key(rec: Dict[str, Any]) -> str:
     return gid or "unknown"
 
 def index_by_match_key(products: List[Dict[str,Any]]) -> Dict[str, Dict[str,Any]]:
-    """
-    Index one-block-per-product by match key (Drug name → fallback pid → fallback gid).
-    If multiple blocks collapse to the same key, keep the first in encounter order.
-    """
     idx: Dict[str, Dict[str,Any]] = {}
     for rec in products:
         key = _drug_match_key(rec)
@@ -1002,7 +1060,7 @@ def make_drug_compare_table(src_rec: Dict[str,Any], prc_rec: Dict[str,Any]) -> p
         "Lot No",
         "MAH",
         "Action Taken",
-        "Drug Obtain Country",   # <-- NEW
+        "Drug Obtain Country",
     ]
     rows = []
     for f in fields:
@@ -1010,12 +1068,19 @@ def make_drug_compare_table(src_rec: Dict[str,Any], prc_rec: Dict[str,Any]) -> p
     return compare_table(rows, treat_as_dates=False)
 
 # --------------- UI: Upload & Parse ----------------
-st.markdown("### 📤 Upload the two XML files you want to compare (no ID pairing; exact files compared)")
-c1, c2 = st.columns(2)
-with c1:
+st.markdown("### 📤 Upload the two XML files you want to compare (and optional MedDRA mapping)")
+
+col1, col2 = st.columns(2)
+with col1:
     src_file = st.file_uploader("Source XML", type=["xml"], key="src_xml")
-with c2:
+with col2:
     prc_file = st.file_uploader("Processed XML", type=["xml"], key="prc_xml")
+
+mapping_file = st.file_uploader(
+    "MedDRA LLT–PT Mapping (Excel) — columns: LLT Code, LLT Term, PT Code, PT Term",
+    type=["xlsx"], key="meddra_map"
+)
+meddra_map = load_meddra_mapping(mapping_file) if mapping_file else {}
 
 if not (src_file and prc_file):
     st.info("Please upload **both** Source and Processed XML files to view the tabular comparison.")
@@ -1025,9 +1090,9 @@ src_bytes = src_file.read()
 prc_bytes = prc_file.read()
 
 with st.spinner("Parsing Source..."):
-    src = extract_model(src_bytes, debug_events=DEBUG_EVENTS)
+    src = extract_model(src_bytes, meddra_map=meddra_map, debug_events=DEBUG_EVENTS, debug_mh=DEBUG_MH)
 with st.spinner("Parsing Processed..."):
-    prc = extract_model(prc_bytes, debug_events=DEBUG_EVENTS)
+    prc = extract_model(prc_bytes, meddra_map=meddra_map, debug_events=DEBUG_EVENTS, debug_mh=DEBUG_MH)
 
 if src.get("_error") or prc.get("_error"):
     st.error(f"Source error: {src.get('_error','-')}\nProcessed error: {prc.get('_error','-')}")
@@ -1086,6 +1151,8 @@ def make_mh_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: st
     fields = [
         ("LLT Code","text"),
         ("LLT Term","text"),
+        ("PT Code","text"),
+        ("PT Term","text"),
         ("Status","text"),
         ("Start Date","date"),
         ("End Date","date"),
@@ -1164,7 +1231,7 @@ else:
             st.table(d_df)
         st.markdown('</div>', unsafe_allow_html=True)
 
-# ---------------- SECTION: Event Details — matched by LLT code (fallback normalized term) ----------------
+# ---------------- SECTION: Event Details — matched by LLT code (fallback: normalized term) ----------------
 st.subheader("Event Details — matched by LLT code (fallback: normalized term)")
 src_evts = src.get("Events", [])
 prc_evts = prc.get("Events", [])
@@ -1179,6 +1246,8 @@ def make_event_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title:
     fields = [
         ("LLT Code","text"),
         ("LLT Term","text"),
+        ("PT Code","text"),
+        ("PT Term","text"),
         ("Seriousness","text"),
         ("Outcome","text"),
         ("Event Start","date"),
@@ -1272,7 +1341,7 @@ for key in all_mh_keys:
     se = src_mh_idx.get(key, {})
     pe = prc_mh_idx.get(key, {})
     title = se.get("LLT Term") or se.get("LLT Code") or pe.get("LLT Term") or pe.get("LLT Code") or "(Unnamed history)"
-    for field in ["LLT Code","LLT Term","Status","Start Date","End Date"]:
+    for field in ["LLT Code","LLT Term","PT Code","PT Term","Status","Start Date","End Date"]:
         s_val = se.get(field, "") or (format_date(se.get(field + " (raw)","")) if "Date" in field else "")
         p_val = pe.get(field, "") or (format_date(pe.get(field + " (raw)","")) if "Date" in field else "")
         if has_value(s_val) or has_value(p_val):
@@ -1284,7 +1353,7 @@ for key in all_evt_keys:
     se = src_evt_idx.get(key, {})
     pe = prc_evt_idx.get(key, {})
     title = se.get("LLT Term") or se.get("LLT Code") or pe.get("LLT Term") or pe.get("LLT Code") or "(Unnamed event)"
-    for field in ["LLT Code","LLT Term","Seriousness","Outcome","Event Start","Event End"]:
+    for field in ["LLT Code","LLT Term","PT Code","PT Term","Seriousness","Outcome","Event Start","Event End"]:
         s_val = se.get(field, "") or (format_date(se.get(field + " (raw)","")) if "Event" in field else "")
         p_val = pe.get(field, "") or (format_date(pe.get(field + " (raw)","")) if "Event" in field else "")
         if has_value(s_val) or has_value(p_val):
