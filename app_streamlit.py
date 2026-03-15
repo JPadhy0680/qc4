@@ -12,22 +12,22 @@ st.title("🧪📄📄 E2B_R3 Two‑File Comparator — Tabular, Box‑wise")
 
 # Optional debug toggles
 DEBUG_EVENTS = st.sidebar.checkbox("Debug events parsing", value=False)
-DEBUG_MH     = st.sidebar.checkbox("Debug medical history parsing", value=False)
-DEBUG_LAB    = st.sidebar.checkbox("Debug lab parsing", value=False)
-DEBUG_CAUS   = st.sidebar.checkbox("Debug causality parsing", value=False)
+DEBUG_MH = st.sidebar.checkbox("Debug medical history parsing", value=False)
+DEBUG_LAB = st.sidebar.checkbox("Debug lab parsing", value=False)
+DEBUG_CAUS = st.sidebar.checkbox("Debug causality parsing", value=False)
 
 # ---------------- Utilities ----------------
 NS = {'hl7': 'urn:hl7-org:v3', 'xsi': 'http://www.w3.org/2001/XMLSchema-instance'}
 UNKNOWN_TOKENS = {"unk", "asku", "unknown"}
 
 # Admin identifiers
-SENDER_ID_OID      = "2.16.840.1.113883.3.989.2.1.3.1"   # Sender ID
-WWID_OID           = "2.16.840.1.113883.3.989.2.1.3.2"   # WWID
-FIRST_SENDER_OID   = "2.16.840.1.113883.3.989.2.1.1.3"   # First sender of case (1=Regulator, 2=Other)
-FIRST_SENDER_MAP   = {"1": "Regulator", "2": "Other"}
+SENDER_ID_OID = "2.16.840.1.113883.3.989.2.1.3.1"  # Sender ID
+WWID_OID = "2.16.840.1.113883.3.989.2.1.3.2"       # WWID
+FIRST_SENDER_OID = "2.16.840.1.113883.3.989.2.1.1.3"  # First sender of case (1=Regulator, 2=Other)
+FIRST_SENDER_MAP = {"1": "Regulator", "2": "Other"}
 
 # Reporter qualification OID and mapping (1..5)
-REPORTER_QUAL_OID  = "2.16.840.1.113883.3.989.2.1.1.6"
+REPORTER_QUAL_OID = "2.16.840.1.113883.3.989.2.1.1.6"
 REPORTER_MAP = {
     "1": "Physician",
     "2": "Pharmacist",
@@ -37,10 +37,10 @@ REPORTER_MAP = {
 }
 
 # Reporter SOURCE anchor OID
-REPORT_SOURCE_OID  = "2.16.840.1.113883.3.989.2.1.1.22"  # displayName="sourceReport"
+REPORT_SOURCE_OID = "2.16.840.1.113883.3.989.2.1.1.22"  # displayName="sourceReport"
 
 # Patient OIDs
-AGE_OID            = "2.16.840.1.113883.3.989.2.1.1.19"
+AGE_OID = "2.16.840.1.113883.3.989.2.1.1.19"
 PATIENT_RECORD_OID = "2.16.840.1.113883.3.989.2.1.3.7"
 
 # ---- Action Taken ----
@@ -55,11 +55,11 @@ ACTION_TAKEN_MAP = {
 }
 
 # MedDRA / Clinical section OIDs
-MEDDRA_LLT_OID = "2.16.840.1.113883.6.163"               # LLT codes in observations
-MH_SECTION_OID = "2.16.840.1.113883.3.989.2.1.1.20"      # clinical sections (MH, Labs, etc.)
-STATUS_OID     = "2.16.840.1.113883.3.989.2.1.1.19"      # status & flags; includes 'causality'(39) and 'interventionCharacterization'(20)
+MEDDRA_LLT_OID = "2.16.840.1.113883.6.163"  # LLT codes in observations
+MH_SECTION_OID = "2.16.840.1.113883.3.989.2.1.1.20"  # clinical sections (MH, Labs, etc.)
+STATUS_OID = "2.16.840.1.113883.3.989.2.1.1.19"  # status & flags; includes 'causality'(39) and 'interventionCharacterization'(20)
 INTERVENTION_CHAR_CODE = "20"  # observed in your snippet for interventionCharacterization
-CAUSALITY_CODE         = "39"  # for causality
+CAUSALITY_CODE = "39"          # for causality
 
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
 TD_PATHS = [
@@ -124,7 +124,7 @@ def clean_value(v: Any) -> str:
 
 def normalize_text(s: str) -> str:
     s = (s or "").lower()
-    s = re.sub(r'[^a-z0-9\s\+\-]', ' ', s)
+    s = re.sub(r'[^a-z0-9\s+\-]', ' ', s)
     return re.sub(r'\s+', ' ', s).strip()
 
 def map_gender(code: str) -> str:
@@ -175,7 +175,6 @@ def _parse_sheet_xml(sheet_xml_bytes: bytes, shared_strings: List[str]) -> pd.Da
     from xml.etree.ElementTree import fromstring
     root = fromstring(sheet_xml_bytes)
     ns = {'a': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
-
     rows = []
     max_col = 0
     for row in root.findall('.//a:sheetData/a:row', ns):
@@ -207,10 +206,8 @@ def _parse_sheet_xml(sheet_xml_bytes: bytes, shared_strings: List[str]) -> pd.Da
                 if idx <= max_col:
                     row_list[idx] = val
             rows.append(row_list)
-
     if not rows:
         return pd.DataFrame()
-
     header = rows[0]
     data = rows[1:] if len(rows) > 1 else []
     header = [h if h else f"col_{i+1}" for i, h in enumerate(header)]
@@ -219,7 +216,6 @@ def _parse_sheet_xml(sheet_xml_bytes: bytes, shared_strings: List[str]) -> pd.Da
 def _read_xlsx_no_openpyxl(uploaded_file) -> pd.DataFrame:
     data = uploaded_file.read()
     zf = zipfile.ZipFile(io.BytesIO(data))
-
     shared_strings: List[str] = []
     try:
         sst = zf.read('xl/sharedStrings.xml')
@@ -243,18 +239,16 @@ def _read_xlsx_no_openpyxl(uploaded_file) -> pd.DataFrame:
                 break
     if sheet_bytes is None:
         raise ValueError("No worksheet XML found in XLSX.")
-
     return _parse_sheet_xml(sheet_bytes, shared_strings)
 
 # ---- MedDRA mapping loader (no openpyxl needed) ----
 def load_meddra_mapping(uploaded_file) -> Dict[str, Dict[str, str]]:
     """
     Load MedDRA mapping (.xlsx or .csv) with columns:
-      LLT Code, LLT Term, PT Code, PT Term (case-insensitive).
+    LLT Code, LLT Term, PT Code, PT Term (case-insensitive).
     """
     if not uploaded_file:
         return {}
-
     fname = (uploaded_file.name or "").lower()
     try:
         if fname.endswith(".csv"):
@@ -282,8 +276,8 @@ def load_meddra_mapping(uploaded_file) -> Dict[str, Dict[str, str]]:
                 continue
             mapping[llt_code] = {
                 "LLT Term": str(row[cols['llt term']]).strip() if pd.notna(row[cols['llt term']]) else "",
-                "PT Code":  str(row[cols['pt code']]).strip()  if pd.notna(row[cols['pt code']])  else "",
-                "PT Term":  str(row[cols['pt term']]).strip()  if pd.notna(row[cols['pt term']])  else "",
+                "PT Code": str(row[cols['pt code']]).strip() if pd.notna(row[cols['pt code']]) else "",
+                "PT Term": str(row[cols['pt term']]).strip() if pd.notna(row[cols['pt term']]) else "",
             }
         except Exception:
             continue
@@ -295,9 +289,9 @@ def load_meddra_mapping(uploaded_file) -> Dict[str, Dict[str, str]]:
 def read_numeric_with_unit(value_node: Optional[ET.Element]) -> str:
     """
     Reads common value structures:
-      - <value xsi:type="PQ" value=".." unit=".."/>
-      - <value xsi:type="IVL_PQ"><center value=".." unit=".."/></value>
-      - <value><low/><high/></value>
+    - <value xsi:type="PQ" value=".." unit=".."/>
+    - <value xsi:type="IVL_PQ"><center value=".." unit=".."/></value>
+    - <value><low/><high/></value>
     """
     if value_node is None:
         return ""
@@ -305,15 +299,13 @@ def read_numeric_with_unit(value_node: Optional[ET.Element]) -> str:
     u = (value_node.attrib.get('unit') or '').strip()
     if v or u:
         return f"{v} {u}".strip()
-
     center = value_node.find('.//hl7:center', NS)
     if center is not None:
         cv = (center.attrib.get('value') or '').strip()
         cu = (center.attrib.get('unit') or '').strip()
         if cv or cu:
             return f"{cv} {cu}".strip()
-
-    low  = value_node.find('.//hl7:low', NS)
+    low = value_node.find('.//hl7:low', NS)
     high = value_node.find('.//hl7:high', NS)
     lv = (low.attrib.get('value') or '').strip() if low is not None else ''
     lu = (low.attrib.get('unit') or '').strip() if low is not None else ''
@@ -323,7 +315,6 @@ def read_numeric_with_unit(value_node: Optional[ET.Element]) -> str:
         lo = f"{lv} {lu}".strip() if (lv or lu) else ""
         hi = f"{hv} {hu}".strip() if (hv or hu) else ""
         return f"{lo} – {hi}".strip(' –')
-
     return get_text(value_node)
 
 # ---------------- Admin extraction ----------------
@@ -509,11 +500,9 @@ def build_reaction_id_to_term(root: ET.Element, meddra_map: Optional[Dict[str, D
         code_el = obs.find('hl7:code', NS)
         if code_el is None or (code_el.attrib.get('displayName') or '').strip().lower() != 'reaction':
             continue
-
         id_el = find_first(obs, './/hl7:id')
         rid_root = (id_el.attrib.get('root') or '').strip() if id_el is not None else ''
-        rid_ext  = (id_el.attrib.get('extension') or '').strip() if id_el is not None else ''
-
+        rid_ext = (id_el.attrib.get('extension') or '').strip() if id_el is not None else ''
         llt_term = ""
         val_el = obs.find('hl7:value', NS)
         llt_code = (val_el.attrib.get('code') or '').strip() if val_el is not None else ''
@@ -521,11 +510,10 @@ def build_reaction_id_to_term(root: ET.Element, meddra_map: Optional[Dict[str, D
             llt_term = (meddra_map[llt_code].get("LLT Term") or "").strip()
         if not llt_term and val_el is not None:
             llt_term = (val_el.attrib.get('displayName') or '').strip()
-            if not llt_term:
-                ot = val_el.find('hl7:originalText', NS)
-                if ot is not None and (ot.text or '').strip():
-                    llt_term = ot.text.strip()
-
+        if not llt_term:
+            ot = val_el.find('hl7:originalText', NS) if val_el is not None else None
+            if ot is not None and (ot.text or '').strip():
+                llt_term = ot.text.strip()
         if llt_term:
             if rid_root:
                 out[rid_root] = llt_term
@@ -561,14 +549,14 @@ def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dic
             if meddra_map and llt_code in meddra_map:
                 m = meddra_map[llt_code]
                 llt_term = (m.get("LLT Term") or "").strip()
-                pt_code  = (m.get("PT Code") or "").strip()
-                pt_term  = (m.get("PT Term") or "").strip()
+                pt_code = (m.get("PT Code") or "").strip()
+                pt_term = (m.get("PT Term") or "").strip()
             if not llt_term:
                 llt_term = (code.attrib.get('displayName') or '').strip()
-                if not llt_term:
-                    ot = code.find('hl7:originalText', NS)
-                    if ot is not None and (ot.text or '').strip():
-                        llt_term = ot.text.strip()
+            if not llt_term:
+                ot = code.find('hl7:originalText', NS)
+                if ot is not None and (ot.text or '').strip():
+                    llt_term = ot.text.strip()
 
             # status from inboundRelationship OBS/EVN with STATUS_OID, BL true
             statuses: List[str] = []
@@ -582,7 +570,7 @@ def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dic
                             statuses.append(lbl)
 
             # Dates
-            low  = obs.find('.//hl7:effectiveTime/hl7:low', NS)
+            low = obs.find('.//hl7:effectiveTime/hl7:low', NS)
             high = obs.find('.//hl7:effectiveTime/hl7:high', NS)
             sd_raw = (low.attrib.get('value') or '').strip() if low is not None else ''
             ed_raw = (high.attrib.get('value') or '').strip() if high is not None else ''
@@ -592,7 +580,6 @@ def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dic
             key = llt_code or normalize_text(llt_term)
             if not key:
                 continue
-
             items.append({
                 "LLT Code": clean_value(llt_code),
                 "LLT Term": clean_value(llt_term),
@@ -605,7 +592,6 @@ def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dic
                 "End Date": ed,
                 "_key": key,
             })
-
     if debug and not items:
         st.info("No medical history items parsed from expected section.")
     return items
@@ -629,7 +615,6 @@ def extract_labs(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]
 
     for anc in anchors:
         container = pmap.get(anc, None) or root
-
         for obs in container.findall('.//hl7:observation[@classCode="OBS"][@moodCode="EVN"]', NS):
             code = obs.find('hl7:code', NS)
             if code is None or (code.attrib.get('codeSystem') or '').strip() != MEDDRA_LLT_OID:
@@ -640,14 +625,14 @@ def extract_labs(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]
             if meddra_map and llt_code in meddra_map:
                 m = meddra_map[llt_code]
                 llt_term = (m.get("LLT Term") or "").strip()
-                pt_code  = (m.get("PT Code") or "").strip()
-                pt_term  = (m.get("PT Term") or "").strip()
+                pt_code = (m.get("PT Code") or "").strip()
+                pt_term = (m.get("PT Term") or "").strip()
             if not llt_term:
                 llt_term = (code.attrib.get('displayName') or '').strip()
-                if not llt_term:
-                    ot = code.find('hl7:originalText', NS)
-                    if ot is not None and (ot.text or '').strip():
-                        llt_term = ot.text.strip()
+            if not llt_term:
+                ot = code.find('hl7:originalText', NS)
+                if ot is not None and (ot.text or '').strip():
+                    llt_term = ot.text.strip()
 
             # Result
             value_node = obs.find('hl7:value', NS)
@@ -661,7 +646,7 @@ def extract_labs(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]
                 if v:
                     date_val = format_date(v)
                 else:
-                    low  = eff.find('hl7:low', NS)
+                    low = eff.find('hl7:low', NS)
                     high = eff.find('hl7:high', NS)
                     lv = (low.attrib.get('value') or '').strip() if low is not None else ''
                     hv = (high.attrib.get('value') or '').strip() if high is not None else ''
@@ -671,7 +656,7 @@ def extract_labs(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]
             more_info = ""
             for outb in obs.findall('.//hl7:outboundRelationship/hl7:observation', NS):
                 scode = outb.find('hl7:code', NS)
-                bval  = outb.find('hl7:value', NS)
+                bval = outb.find('hl7:value', NS)
                 if scode is not None and (scode.attrib.get('codeSystem') or '').strip() == STATUS_OID:
                     label = (scode.attrib.get('displayName') or scode.attrib.get('code') or '').strip()
                     if label.lower() == "moreinformationavailable" and bval is not None:
@@ -683,7 +668,6 @@ def extract_labs(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]
             key = llt_code or normalize_text(llt_term)
             if not key:
                 continue
-
             items.append({
                 "LLT Code": clean_value(llt_code),
                 "LLT Term": clean_value(llt_term),
@@ -694,7 +678,6 @@ def extract_labs(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]
                 "More Info Available": clean_value(more_info),
                 "_key": key,
             })
-
     if debug and not items:
         st.info("No lab details parsed from expected section.")
     return items
@@ -707,9 +690,9 @@ def _iter_components_in_doc_order(root: ET.Element) -> List[ET.Element]:
 def _resolve_intervention_label(val_node: Optional[ET.Element]) -> str:
     """
     Best-effort label from <value> for interventionCharacterization:
-      - prefer @displayName
-      - else if @code present -> "code:<code>"
-      - else text content / originalText
+    - prefer @displayName
+    - else if @code present -> "code:<code>"
+    - else text content / originalText
     """
     if val_node is None:
         return ""
@@ -732,29 +715,30 @@ def extract_causality(
 ) -> List[Dict[str, Any]]:
     """
     Intervention-aware causality extraction:
-
     For each <component typeCode="COMP">:
-      - Iterate child <causalityAssessment> in document order.
-      - When codeSystem=STATUS_OID and displayName='interventionCharacterization' (or code='20'):
-          set current_intervention = resolved label from <value>.
-      - When codeSystem=STATUS_OID and displayName='causality' (or code='39'):
-          emit a causality row enriched with current_intervention (until reset by next interventionCharacterization).
+    - Iterate child <causalityAssessment> in document order.
+    - When codeSystem=STATUS_OID and displayName='interventionCharacterization' (or code='20'):
+      set current_intervention = resolved label from <value>.
+    - When codeSystem=STATUS_OID and displayName='causality' (or code='39'):
+      emit a causality row enriched with current_intervention (until reset by next interventionCharacterization).
+
+    Fixes:
+    - Assessment now robustly reads ST text when @value is absent.
+    - Assessor prefers author/assignedEntity(or assignedAuthor)/code/originalText ("Company"/"Reporter") before fallbacks.
     """
     out: List[Dict[str, Any]] = []
-    parent = build_parent_map(root)
-
     try:
         for comp in _iter_components_in_doc_order(root):
             current_intervention = ""  # resets per component
+
             # find all causalityAssessment under this component in doc order
             ca_nodes = comp.findall('.//hl7:causalityAssessment[@classCode="OBS"][@moodCode="EVN"]', NS)
-
             for node in ca_nodes:
                 ccode = node.find('hl7:code', NS)
                 if ccode is None:
                     continue
-                cs  = (ccode.attrib.get('codeSystem') or '').strip()
-                cd  = (ccode.attrib.get('code') or '').strip()
+                cs = (ccode.attrib.get('codeSystem') or '').strip()
+                cd = (ccode.attrib.get('code') or '').strip()
                 dsn = (ccode.attrib.get('displayName') or '').strip().lower()
 
                 if cs != STATUS_OID:
@@ -766,25 +750,37 @@ def extract_causality(
                     continue  # not a result row itself
 
                 # --- Causality result rows
-                if not (dsn == 'causality' or cd == CAUSALITY_CODE):
+                if not (cd == CAUSALITY_CODE or dsn == 'causality'):
                     continue
 
-                # Assessment
+                # Assessment (value can be ST text)
                 val = find_first(node, './/hl7:value')
-                assessment = (val.attrib.get('value') or "").strip() if val is not None else ""
-                if not assessment and val is not None:
-                    assessment = get_text(val)
+                assessment = ""
+                if val is not None:
+                    assessment = (val.attrib.get('value') or "").strip()
+                    if not assessment:
+                        assessment = (val.text or "").strip()
 
                 # Method
                 method = get_text(find_first(node, './/hl7:methodCode/hl7:originalText'))
 
-                # Assessor
+                # Assessor: prefer assignedEntity/assignedAuthor -> code/originalText
                 assessor = ""
-                nm = find_first(node, './/hl7:author//hl7:assignedEntity//hl7:name')
-                if nm is not None:
-                    assessor = get_text(nm)
+                pref_paths = [
+                    './/hl7:author//hl7:assignedEntity//hl7:code/hl7:originalText',
+                    './/hl7:author//hl7:assignedAuthor//hl7:code/hl7:originalText',
+                ]
+                for xp in pref_paths:
+                    aot = find_first(node, xp)
+                    if aot is not None and (aot.text or '').strip():
+                        assessor = aot.text.strip()
+                        break
                 if not assessor:
-                    assessor = get_text(find_first(node, './/hl7:author//hl7:assignedEntity//hl7:originalText'))
+                    nm = find_first(node, './/hl7:author//hl7:assignedEntity//hl7:name')
+                    if nm is not None:
+                        assessor = get_text(nm)
+                    if not assessor:
+                        assessor = get_text(find_first(node, './/hl7:author//hl7:assignedEntity//hl7:originalText'))
 
                 # References
                 evt_id = ""
@@ -821,15 +817,13 @@ def extract_causality(
                     "Reaction": clean_value(reaction_name),
                     "Drug": clean_value(drug_name),
                     "Intervention Characterization": clean_value(current_intervention),
-                    "_key": key,       # internal pairing only
-                    "_evt_id": evt_id, # internal; not displayed
-                    "_prd_id": prd_id, # internal; not displayed
+                    "_key": key,  # internal pairing only
+                    "_evt_id": evt_id,  # internal; not displayed
+                    "_prd_id": prd_id,  # internal; not displayed
                 })
-
     except Exception as e:
         if debug:
             st.warning(f"Causality parse error: {e}")
-
     return out
 
 # ---------------- Products extraction (ALL; group by COMPONENT; NO REGIMENS) ----------------
@@ -907,13 +901,12 @@ def _add_unique(acc_list: List[str], value: str):
         acc_list.append(v)
 
 def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
-    suspects   = extract_suspect_ids(root)
-    interact   = extract_interacting_ids(root)
+    suspects = extract_suspect_ids(root)
+    interact = extract_interacting_ids(root)
     treatments = extract_treatment_ids(root)
 
     out: List[Dict[str, Any]] = []
     comps = _iter_drug_components(root)
-
     for cidx, comp in enumerate(comps, start=1):
         sas = comp.findall('.//hl7:substanceAdministration[@classCode="SBADM"][@moodCode="EVN"]', NS)
         if not sas:
@@ -939,10 +932,10 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
 
         # Classification at drug level using pid
         tags = set()
-        if pid and pid in suspects:   tags.add("Suspect")
-        if pid and pid in interact:   tags.add("Interacting")
+        if pid and pid in suspects: tags.add("Suspect")
+        if pid and pid in interact: tags.add("Interacting")
         if pid and pid in treatments: tags.add("Treatment")
-        if not tags:                  tags.add("Concomitant")
+        if not tags: tags.add("Concomitant")
         type_disp = ", ".join(sorted(tags))
 
         # Aggregated fields (de-duplicated)
@@ -967,14 +960,14 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
             dq = find_first(sa, './/hl7:doseQuantity')
             if dq is not None:
                 _add_unique(agg["Dose Value"], dq.attrib.get('value', ''))
-                _add_unique(agg["Dose Unit"],  dq.attrib.get('unit', ''))
+                _add_unique(agg["Dose Unit"], dq.attrib.get('unit', ''))
 
-            low  = find_first(sa, './/hl7:effectiveTime/hl7:low')
+            low = find_first(sa, './/hl7:effectiveTime/hl7:low')
             high = find_first(sa, './/hl7:effectiveTime/hl7:high')
             sd = format_date((low.attrib.get('value') or '').strip() if low is not None else '')
             ed = format_date((high.attrib.get('value') or '').strip() if high is not None else '')
             _add_unique(agg["Start Date"], sd)
-            _add_unique(agg["Stop Date"],  ed)
+            _add_unique(agg["Stop Date"], ed)
 
             rtxt = get_text(find_first(sa, './/hl7:routeCode/hl7:originalText'))
             if not rtxt:
@@ -985,10 +978,10 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
             form = get_text(find_first(sa, './/hl7:formCode/hl7:originalText'))
             _add_unique(agg["Formulation"], form)
 
-            lot  = get_text(find_first(sa, './/hl7:lotNumberText'))
+            lot = get_text(find_first(sa, './/hl7:lotNumberText'))
             _add_unique(agg["Lot No"], lot)
 
-            mah  = ""
+            mah = ""
             for p in [
                 './/hl7:playingOrganization/hl7:name',
                 './/hl7:manufacturerOrganization/hl7:name',
@@ -1021,20 +1014,19 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
             "Drug": title,
             "Type": type_disp,
             "Dosage Text": join_vals(agg["Dosage Text"]),
-            "Dose Value":   join_vals(agg["Dose Value"]),
-            "Dose Unit":    join_vals(agg["Dose Unit"]),
-            "Start Date":   join_vals(agg["Start Date"]),
-            "Stop Date":    join_vals(agg["Stop Date"]),
-            "Route":        join_vals(agg["Route"]),
-            "Formulation":  join_vals(agg["Formulation"]),
-            "Lot No":       join_vals(agg["Lot No"]),
-            "MAH":          join_vals(agg["MAH"]),
+            "Dose Value": join_vals(agg["Dose Value"]),
+            "Dose Unit": join_vals(agg["Dose Unit"]),
+            "Start Date": join_vals(agg["Start Date"]),
+            "Stop Date": join_vals(agg["Stop Date"]),
+            "Route": join_vals(agg["Route"]),
+            "Formulation": join_vals(agg["Formulation"]),
+            "Lot No": join_vals(agg["Lot No"]),
+            "MAH": join_vals(agg["MAH"]),
             "Action Taken": join_vals(agg["Action Taken"]),
             "Drug Obtain Country": join_vals(agg["Drug Obtain Country"]),
             "_gid": f"pid::{pid.lower()}" if pid else f"comp::{cidx:03d}",
             "_pid": pid or "",
         })
-
     return out
 
 # ---------------- Reporter extraction (STRICT: only sourceReport branches) ----------------
@@ -1070,7 +1062,8 @@ def find_all_source_report_containers(root: ET.Element) -> List[ET.Element]:
                     cand = anc.find(xp, NS)
                     if cand is not None:
                         containers.append(cand)
-                break
+                        break
+
     # de-dup by identity & preserve order
     seen, uniq = set(), []
     for el in containers:
@@ -1095,11 +1088,12 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
         "Reporter Email(s)": "",
         "Reporter Fax(es)": "",
     }
+
     # IDs
     ids = []
     for id_el in node.findall('.//hl7:id', NS):
         ext = (id_el.attrib.get('extension') or '').strip()
-        rt  = (id_el.attrib.get('root') or '').strip()
+        rt = (id_el.attrib.get('root') or '').strip()
         if ext and rt: ids.append(f"{ext} ({rt})")
         elif ext: ids.append(ext)
         elif rt: ids.append(rt)
@@ -1129,9 +1123,9 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
         fam_el = name_el.find('hl7:family', NS)
         family_val = read_text_or_mask(fam_el)
 
-    result["Reporter Title"]         = "; ".join(title_vals) if title_vals else ""
+    result["Reporter Title"] = "; ".join(title_vals) if title_vals else ""
     result["Reporter Given Name(s)"] = "; ".join(given_vals) if given_vals else ""
-    result["Reporter Family Name"]   = family_val
+    result["Reporter Family Name"] = family_val
 
     # Organization
     for xp in [
@@ -1154,19 +1148,19 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
             val = read_text_or_mask(sl)
             if val:
                 streets.append(val)
-        city   = read_text_or_mask(addr.find('hl7:city', NS))
-        state  = read_text_or_mask(addr.find('hl7:state', NS))
+        city = read_text_or_mask(addr.find('hl7:city', NS))
+        state = read_text_or_mask(addr.find('hl7:state', NS))
         postal = read_text_or_mask(addr.find('hl7:postalCode', NS))
         country= read_text_or_mask(addr.find('hl7:country', NS))
-    if not country:
-        loc = node.find('.//hl7:asLocatedEntity/hl7:location/hl7:code', NS)
-        if loc is not None and loc.attrib.get('code'):
-            country = loc.attrib.get('code').strip()
-    result["Reporter Street"]         = ", ".join(streets)
-    result["Reporter City/Town"]      = city
+        if not country:
+            loc = node.find('.//hl7:asLocatedEntity/hl7:location/hl7:code', NS)
+            if loc is not None and loc.attrib.get('code'):
+                country = loc.attrib.get('code').strip()
+    result["Reporter Street"] = ", ".join(streets)
+    result["Reporter City/Town"] = city
     result["Reporter State/Province"] = state
-    result["Reporter Postal Code"]    = postal
-    result["Reporter Country"]        = country
+    result["Reporter Postal Code"] = postal
+    result["Reporter Country"] = country
 
     # Telecoms
     phones, emails, faxes = [], [], []
@@ -1193,7 +1187,7 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
                     phones.append(raw)
     if phones: result["Reporter Phone(s)"] = "; ".join(dict.fromkeys(phones))
     if emails: result["Reporter Email(s)"] = "; ".join(dict.fromkeys(emails))
-    if faxes:  result["Reporter Fax(es)"]  = "; ".join(dict.fromkeys(faxes))
+    if faxes: result["Reporter Fax(es)"] = "; ".join(dict.fromkeys(faxes))
     return result
 
 def extract_reporters_from_sourceReport(root: ET.Element) -> List[Dict[str, str]]:
@@ -1223,9 +1217,7 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str
         "5": "Fatal",
         "0": "Unknown"
     }
-
     out: List[Dict[str, Any]] = []
-
     try:
         rxns = findall(root, './/hl7:observation')
         for rxn in rxns:
@@ -1241,14 +1233,14 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str
             if meddra_map and llt_code in meddra_map:
                 m = meddra_map[llt_code]
                 llt_term = (m.get("LLT Term") or "").strip()
-                pt_code  = (m.get("PT Code") or "").strip()
-                pt_term  = (m.get("PT Term") or "").strip()
+                pt_code = (m.get("PT Code") or "").strip()
+                pt_term = (m.get("PT Term") or "").strip()
             if not llt_term and val_el is not None:
                 llt_term = (val_el.attrib.get('displayName') or '').strip()
-                if not llt_term:
-                    ot = val_el.find('hl7:originalText', NS)
-                    if ot is not None and (ot.text or '').strip():
-                        llt_term = ot.text.strip()
+            if not llt_term:
+                ot = val_el.find('hl7:originalText', NS) if val_el is not None else None
+                if ot is not None and (ot.text or '').strip():
+                    llt_term = ot.text.strip()
 
             # Seriousness flags
             flags: List[str] = []
@@ -1267,9 +1259,9 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str
             low = rxn.find('.//hl7:effectiveTime/hl7:low', NS)
             high= rxn.find('.//hl7:effectiveTime/hl7:high', NS)
             start_raw = (low.attrib.get('value') or '').strip() if low is not None else ''
-            end_raw   = (high.attrib.get('value') or '').strip() if high is not None else ''
+            end_raw = (high.attrib.get('value') or '').strip() if high is not None else ''
             start_disp= format_date(start_raw)
-            end_disp  = format_date(end_raw)
+            end_disp = format_date(end_raw)
 
             key = clean_value(llt_code) or normalize_text(llt_term)
             if not key:
@@ -1288,7 +1280,6 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str
                 "Event End": end_disp,
                 "_key": key,
             })
-
         return out
     except Exception as e:
         if debug:
@@ -1308,17 +1299,19 @@ def extract_model(xml_bytes: bytes, meddra_map: Optional[Dict[str, Dict[str,str]
         root = ET.fromstring(xml_bytes)
     except Exception as e:
         return {"_error": f"XML parse error: {e}"}
+
     model: Dict[str, Any] = {}
     model["Sender ID"] = extract_sender_id(root)
     model["WWID"] = extract_wwid(root)
     model["First Sender Type"] = extract_first_sender_type(root)
     model.update(extract_td_frd_lrd(root))
+
     model["Reporters"] = extract_reporters_from_sourceReport(root)
     model["Patient"] = extract_patient(root)
 
     # Clinical sections
     model["MedicalHistory"] = extract_medical_history(root, meddra_map=meddra_map, debug=debug_mh)
-    model["LabDetails"]     = extract_labs(root, meddra_map=meddra_map, debug=debug_lab)
+    model["LabDetails"] = extract_labs(root, meddra_map=meddra_map, debug=debug_lab)
 
     # Products first (for name map)
     products = extract_all_products(root)
@@ -1360,9 +1353,11 @@ def make_admin_table(src: Dict[str,Any], prc: Dict[str,Any]) -> pd.DataFrame:
     rows.append(("Sender ID", src.get("Sender ID",""), prc.get("Sender ID","")))
     rows.append(("WWID", src.get("WWID",""), prc.get("WWID","")))
     rows.append(("First Sender Type", src.get("First Sender Type",""), prc.get("First Sender Type","")))
+
     src_td_disp = src.get("TD", "") or format_date(src.get("TD_raw", ""))
     prc_lrd_disp = prc.get("LRD", "") or format_date(prc.get("LRD_raw", ""))
     rows.append(("Day Zero", src_td_disp, prc_lrd_disp))
+
     parts = [
         compare_table([rows[0]], treat_as_dates=False),
         compare_table([rows[1]], treat_as_dates=False),
@@ -1425,13 +1420,11 @@ def make_drug_compare_table(src_rec: Dict[str,Any], prc_rec: Dict[str,Any]) -> p
 
 # --------------- UI: Upload & Parse ----------------
 st.markdown("### 📤 Upload the two XML files you want to compare (and optional MedDRA mapping)")
-
 col1, col2 = st.columns(2)
 with col1:
     src_file = st.file_uploader("Source XML", type=["xml"], key="src_xml")
 with col2:
     prc_file = st.file_uploader("Processed XML", type=["xml"], key="prc_xml")
-
 mapping_file = st.file_uploader(
     "MedDRA LLT–PT Mapping (.xlsx or .csv) — columns: LLT Code, LLT Term, PT Code, PT Term",
     type=["xlsx", "csv"], key="meddra_map"
@@ -1495,12 +1488,11 @@ else:
 st.subheader("Patient — Medical History (matched by LLT code; fallback: normalized term)")
 src_mh = src.get("MedicalHistory", []) or []
 prc_mh = prc.get("MedicalHistory", []) or []
-
 def _idx_mh(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
     return {e.get("_key",""): e for e in lst if e.get("_key","")}
 src_mh_idx = _idx_mh(src_mh)
 prc_mh_idx = _idx_mh(prc_mh)
-all_mh_keys = sorted(set(src_mh_idx) | set(prc_mh_idx))
+all_mh_keys = sorted(set(src_mh_idx) | set(prc_mh_idx))  # fixed union
 
 def make_mh_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
     st.markdown(f'<div class="box"><h5>Medical History: {title}</h5>', unsafe_allow_html=True)
@@ -1521,6 +1513,7 @@ def make_mh_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: st
             s_val = s_val or format_date(src_rec.get(field + " (raw)",""))
             p_val = p_val or format_date(prc_rec.get(field + " (raw)",""))
         rows.append((field, s_val, p_val))
+
     mh_df = compare_table(rows, treat_as_dates=True)
     if not mh_df.empty:
         st.table(mh_df)
@@ -1541,12 +1534,11 @@ else:
 st.subheader("Lab Details (matched by LLT code; fallback: normalized term)")
 src_lab = src.get("LabDetails", []) or []
 prc_lab = prc.get("LabDetails", []) or []
-
 def _idx_lab(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
     return {e.get("_key",""): e for e in lst if e.get("_key","")}
 src_lab_idx = _idx_lab(src_lab)
 prc_lab_idx = _idx_lab(prc_lab)
-all_lab_keys = sorted(set(src_lab_idx) | set(prc_lab_idx))
+all_lab_keys = sorted(set(src_lab_idx) | set(prc_lab_idx))  # fixed union
 
 def make_lab_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
     st.markdown(f'<div class="box"><h5>Lab: {title}</h5>', unsafe_allow_html=True)
@@ -1567,6 +1559,7 @@ def make_lab_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: s
             s_val = s_val or format_date(src_rec.get(field,""))
             p_val = p_val or format_date(prc_rec.get(field,""))
         rows.append((field, s_val, p_val))
+
     df = compare_table(rows, treat_as_dates=True)
     if not df.empty:
         st.table(df)
@@ -1585,20 +1578,17 @@ else:
 
 # ---------------- SECTION: Causality Details ----------------
 st.subheader("Causality Details — grouped by last 'Intervention Characterization' within each component")
-
 src_caus = src.get("Causality", []) or []
 prc_caus = prc.get("Causality", []) or []
-
 def _key_caus(item: Dict[str,Any]) -> str:
     # Prefer hidden IDs for stable pairing; fallback with assessment+method+intervention
     k = (item.get("_evt_id","") or "") + "::" + (item.get("_prd_id","") or "")
     if not k.strip(":"):
         k = "assess::" + normalize_text(item.get("Assessment","")) + "::" + normalize_text(item.get("Method","")) + "::" + normalize_text(item.get("Intervention Characterization",""))
     return k
-
 src_caus_idx = { _key_caus(i): i for i in src_caus }
 prc_caus_idx = { _key_caus(i): i for i in prc_caus }
-all_caus_keys = sorted(set(src_caus_idx) | set(prc_caus_idx))
+all_caus_keys = sorted(set(src_caus_idx) | set(prc_caus_idx))  # fixed union
 
 def make_caus_box_for_ui(s: Dict[str,Any], p: Dict[str,Any], title_hint: str):
     st.markdown(f'<div class="box"><h5>Causality: {title_hint}</h5>', unsafe_allow_html=True)
@@ -1633,23 +1623,19 @@ else:
 
 # ---------------- SECTION: Drug Details (ALL products; grouped by COMPONENT; NO REGIMENS) ----------------
 st.subheader("Drug Details (all products) — matched by name → pid → gid")
-
 src_prods = src.get("Products", [])
 prc_prods = prc.get("Products", [])
 
 # Build indices and order
 src_idx = index_by_match_key(src_prods)
 prc_idx = index_by_match_key(prc_prods)
-
 ordered_keys: List[str] = []
 seen_keys = set()
-
 for rec in src_prods:
     k = _drug_match_key(rec)
     if k and k not in seen_keys:
         seen_keys.add(k)
         ordered_keys.append(k)
-
 for rec in prc_prods:
     k = _drug_match_key(rec)
     if k and k not in seen_keys:
@@ -1662,7 +1648,6 @@ else:
     for key in ordered_keys:
         srec = src_idx.get(key, {})
         prec = prc_idx.get(key, {})
-
         title = (
             (srec.get("Drug") or "").strip()
             or (prec.get("Drug") or "").strip()
@@ -1670,7 +1655,6 @@ else:
             or (prec.get("_pid") or "").strip()
             or "(Unnamed drug)"
         )
-
         st.markdown(f'<div class="box"><h5>Drug: {title}</h5>', unsafe_allow_html=True)
         d_df = make_drug_compare_table(srec, prec)
         if not d_df.empty:
@@ -1681,14 +1665,13 @@ else:
 
 # ---------------- SECTION: Event Details — matched by LLT code (fallback: normalized term) ----------------
 st.subheader("Event Details — matched by LLT code (fallback: normalized term)")
-src_evts = src.get("Events", [])
-prc_evts = prc.get("Events", [])
-
+src_evts = src.get("Events", []) or []
+prc_evts = prc.get("Events", []) or []
 def _idx_events(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
     return {e.get("_key",""): e for e in lst if e.get("_key","")}
 src_evt_idx = _idx_events(src_evts)
 prc_evt_idx = _idx_events(prc_evts)
-all_evt_keys = sorted(set(src_evt_idx) | set(prc_evt_idx))
+all_evt_keys = sorted(set(src_evt_idx) | set(prc_evt_idx))  # fixed union
 
 def make_event_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
     st.markdown(f'<div class="box"><h5>Event: {title}</h5>', unsafe_allow_html=True)
@@ -1710,6 +1693,7 @@ def make_event_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title:
             s_val = s_val or format_date(src_rec.get(field + " (raw)",""))
             p_val = p_val or format_date(prc_rec.get(field + " (raw)",""))
         rows.append((field, s_val, p_val))
+
     e_df = compare_table(rows, treat_as_dates=True)
     if not e_df.empty:
         st.table(e_df)
