@@ -9,12 +9,6 @@ from typing import Optional, Dict, Any, List, Tuple, Set
 st.set_page_config(page_title="XML_R3 Comparator", layout="wide")
 st.title("📄XML_R3 Comparator📄")
 
-# Optional debug toggles (kept for other sections)
-DEBUG_EVENTS = st.sidebar.checkbox("Debug events parsing", value=False)
-DEBUG_MH = st.sidebar.checkbox("Debug medical history parsing", value=False)
-DEBUG_LAB = st.sidebar.checkbox("Debug lab parsing", value=False)
-DEBUG_CAUS = st.sidebar.checkbox("Debug causality parsing", value=False)
-
 # ---------------- Utilities ----------------
 NS = {'hl7': 'urn:hl7-org:v3', 'xsi': 'http://www.w3.org/2001/XMLSchema-instance'}
 UNKNOWN_TOKENS = {"unk", "asku", "unknown"}
