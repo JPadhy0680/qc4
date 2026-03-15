@@ -57,7 +57,7 @@ ACTION_TAKEN_MAP = {
 # MedDRA / Clinical section OIDs
 MEDDRA_LLT_OID = "2.16.840.1.113883.6.163"               # LLT codes in observations
 MH_SECTION_OID = "2.16.840.1.113883.3.989.2.1.1.20"      # clinical sections (MH, Labs, etc.)
-STATUS_OID     = "2.16.840.1.113883.3.989.2.1.1.19"      # status & various flags; also carries "causality" (code 39)
+STATUS_OID     = "2.16.840.1.113883.3.989.2.1.1.19"      # status & flags; also carries "causality" (code=39)
 
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
 TD_PATHS = [
@@ -503,10 +503,10 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
 def build_parent_map(root: ET.Element) -> Dict[ET.Element, ET.Element]:
     return {c: p for p in root.iter() for c in list(p)}
 
-# ---------------- Reaction map: RID -> LLT term ----------------
+# ---------------- Reaction map: RID (root/extension) -> LLT term ----------------
 def build_reaction_id_to_term(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]] = None) -> Dict[str, str]:
     """
-    Map reaction OBS id@root -> LLT term for observations with code displayName='reaction'.
+    Map reaction OBS id (root/extension) -> LLT term for observations with code displayName='reaction'.
     """
     out: Dict[str, str] = {}
     for obs in findall(root, './/hl7:observation[@classCode="OBS"][@moodCode="EVN"]'):
@@ -514,13 +514,12 @@ def build_reaction_id_to_term(root: ET.Element, meddra_map: Optional[Dict[str, D
         if code_el is None or (code_el.attrib.get('displayName') or '').strip().lower() != 'reaction':
             continue
 
-        # Observation ID (RID)
+        # Observation ID (RID) may use root OR extension
         id_el = find_first(obs, './/hl7:id')
-        rid = (id_el.attrib.get('root') or '').strip() if id_el is not None else ''
-        if not rid:
-            continue
+        rid_root = (id_el.attrib.get('root') or '').strip() if id_el is not None else ''
+        rid_ext  = (id_el.attrib.get('extension') or '').strip() if id_el is not None else ''
 
-        # LLT from <value>
+        # LLT term
         llt_term = ""
         val_el = obs.find('hl7:value', NS)
         llt_code = (val_el.attrib.get('code') or '').strip() if val_el is not None else ''
@@ -533,8 +532,11 @@ def build_reaction_id_to_term(root: ET.Element, meddra_map: Optional[Dict[str, D
                 if ot is not None and (ot.text or '').strip():
                     llt_term = ot.text.strip()
 
-        if rid and llt_term:
-            out[rid] = llt_term
+        if llt_term:
+            if rid_root:
+                out[rid_root] = llt_term
+            if rid_ext:
+                out[rid_ext] = llt_term
     return out
 
 # ---------------- Medical History extraction ----------------
@@ -699,7 +701,7 @@ def extract_labs(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]
 
     return items
 
-# ---------------- Causality extraction (filtered, name-resolved) ----------------
+# ---------------- Causality extraction (filtered, name-resolved with fallbacks) ----------------
 def extract_causality(
     root: ET.Element,
     product_id_to_name: Optional[Dict[str, str]] = None,
@@ -710,9 +712,13 @@ def extract_causality(
     <causalityAssessment classCode="OBS" moodCode="EVN"> entries where:
       inner <code> has codeSystem=STATUS_OID and (displayName='causality' OR code='39').
     Output shows human-readable Reaction and Drug names (not IDs).
+    If product reference is absent, falls back to nearest enclosing <component> and
+    uses its first SBADM name as the drug.
     """
     out: List[Dict[str, Any]] = []
     try:
+        parent = build_parent_map(root)
+
         for node in findall(root, './/hl7:causalityAssessment[@classCode="OBS"][@moodCode="EVN"]'):
             # Filter by code system + meaning
             ccode = node.find('hl7:code', NS)
@@ -728,9 +734,9 @@ def extract_causality(
 
             # Assessment
             val = find_first(node, './/hl7:value')
-            assessment = ""
-            if val is not None:
-                assessment = (val.attrib.get('value') or "").strip() or get_text(val)
+            assessment = (val.attrib.get('value') or "").strip() if val is not None else ""
+            if not assessment and val is not None:
+                assessment = get_text(val)
 
             # Method
             method = get_text(find_first(node, './/hl7:methodCode/hl7:originalText'))
@@ -753,9 +759,29 @@ def extract_causality(
             if prd is not None:
                 prd_id = (prd.attrib.get('root') or '').strip() or (prd.attrib.get('extension') or '').strip()
 
-            # Resolve names
+            # Resolve Reaction name
             reaction_name = reaction_id_to_term.get(evt_id, "") if (reaction_id_to_term and evt_id) else ""
-            drug_name = product_id_to_name.get(prd_id, "") if (product_id_to_name and prd_id) else ""
+
+            # Resolve Drug name
+            drug_name = ""
+            if product_id_to_name and prd_id:
+                drug_name = product_id_to_name.get(prd_id, "")
+
+            # Fallback: nearest component's first SBADM name (helps company causality without DID)
+            if not drug_name:
+                cur = node
+                comp_el = None
+                while cur in parent:
+                    cur = parent[cur]
+                    if local_name(cur.tag) == 'component' and cur.attrib.get('typeCode') == 'COMP':
+                        comp_el = cur
+                        break
+                if comp_el is not None:
+                    sa = comp_el.find('.//hl7:substanceAdministration[@classCode="SBADM"][@moodCode="EVN"]', NS)
+                    if sa is not None:
+                        nm = _resolve_drug_name(sa).strip()
+                        if nm:
+                            drug_name = nm
 
             # Internal key for pairing
             key = (evt_id or "") + "::" + (prd_id or "")
@@ -769,8 +795,8 @@ def extract_causality(
                 "Reaction": clean_value(reaction_name),
                 "Drug": clean_value(drug_name),
                 "_key": key,       # internal pairing only
-                "_evt_id": evt_id, # kept internal; not displayed
-                "_prd_id": prd_id, # kept internal; not displayed
+                "_evt_id": evt_id, # internal; not displayed
+                "_prd_id": prd_id, # internal; not displayed
             })
     except Exception as e:
         if debug:
@@ -811,6 +837,7 @@ def extract_treatment_ids(root: ET.Element) -> Set[str]:
     return ids
 
 def _resolve_drug_name(admin: ET.Element) -> str:
+    # 1) kindOfProduct/name
     nm = find_first(admin, './/hl7:kindOfProduct/hl7:name')
     if nm is not None:
         t = (nm.text or '').strip()
@@ -819,14 +846,18 @@ def _resolve_drug_name(admin: ET.Element) -> str:
         if disp: return disp
         ot = nm.find('hl7:originalText', NS)
         if ot is not None and (ot.text or '').strip(): return ot.text.strip()
+    # 2) manufacturedProduct/name
     alt = find_first(admin, './/hl7:manufacturedProduct/hl7:name')
     if alt is not None and (alt.text or '').strip(): return alt.text.strip()
+    # 3) manufacturedMaterial/name
     mm = find_first(admin, './/hl7:manufacturedMaterial/hl7:name')
     if mm is not None and (mm.text or '').strip(): return mm.text.strip()
+    # 4) manufacturedMaterial/code@displayName
     mm_code = find_first(admin, './/hl7:manufacturedMaterial/hl7:code')
     if mm_code is not None:
         disp = (mm_code.attrib.get('displayName') or '').strip()
         if disp: return disp
+    # 5) asManufacturedProduct//name
     amp = find_first(admin, './/hl7:asManufacturedProduct//hl7:name')
     if amp is not None and (amp.text or '').strip(): return amp.text.strip()
     return ""
@@ -940,7 +971,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
                     break
             _add_unique(agg["MAH"], mah)
 
-        # ---- Action Taken
+        # ---- Action Taken (scan inside this component)
         for act_code in comp.findall('.//hl7:act[@classCode="ACT"][@moodCode="EVN"]/hl7:code', NS):
             if (act_code.attrib.get('codeSystem') or '').strip() == ACTION_TAKEN_OID:
                 c = (act_code.attrib.get('code') or '').strip()
@@ -948,7 +979,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
                 if label:
                     _add_unique(agg["Action Taken"], label)
 
-        # ---- Drug Obtain Country
+        # ---- Drug Obtain Country: any <country> text within this component
         for cn in comp.findall('.//hl7:country', NS):
             val = (cn.text or '').strip()
             if val:
@@ -1489,6 +1520,7 @@ prc_lab_idx = _idx_lab(prc_lab)
 all_lab_keys = sorted(set(src_lab_idx) | set(prc_lab_idx))
 
 def make_lab_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
+    st.markdown(f'<div class="box'><h5>Lab: {title}</h5>", unsafe_allow_html=True)  # quotes fix for HTML
     st.markdown(f'<div class="box"><h5>Lab: {title}</h5>', unsafe_allow_html=True)
     fields = [
         ("LLT Code","text"),
