@@ -33,13 +33,11 @@ REPORTER_MAP = {
     "5": "Consumer or other non-health professional",
 }
 
-# Reporter SOURCE anchor OID (to locate reporter branches)
+# Reporter SOURCE anchor OID
 REPORT_SOURCE_OID  = "2.16.840.1.113883.3.989.2.1.1.22"  # displayName="sourceReport"
 
-# Patient: Age observation OID
+# Patient OIDs
 AGE_OID            = "2.16.840.1.113883.3.989.2.1.1.19"
-
-# Patient: Record Number OID
 PATIENT_RECORD_OID = "2.16.840.1.113883.3.989.2.1.3.7"
 
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
@@ -143,11 +141,7 @@ def safe_disp(v: str) -> str:
     return v if v else "—"
 
 # ---- Generic patient observation resolver (displayName OR OID) ----
-def get_pq_value_by_code(
-    root: ET.Element,
-    display_name: Optional[str] = None,
-    code_system_oid: Optional[str] = None
-) -> Tuple[str, str]:
+def get_pq_value_by_code(root: ET.Element, display_name: Optional[str] = None, code_system_oid: Optional[str] = None) -> Tuple[str, str]:
     for obs in root.findall('.//hl7:observation', NS):
         code_el = obs.find('hl7:code', NS)
         if code_el is None:
@@ -258,14 +252,12 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
     if not (w_val or w_unit):
         for obs in root.findall('.//hl7:observation', NS):
             val = obs.find('hl7:value', NS)
-            if val is None: 
-                continue
+            if val is None: continue
             u = (val.attrib.get('unit') or '').strip().lower()
             if u in {'kg','lb','lbs'}:
                 w_val = (val.attrib.get('value') or '').strip()
                 w_unit = (val.attrib.get('unit') or '').strip()
-                if w_val:
-                    break
+                if w_val: break
     weight = ""
     if clean_value(w_val):
         weight = clean_value(w_val)
@@ -279,14 +271,12 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
     if not (h_val or h_unit):
         for obs in root.findall('.//hl7:observation', NS):
             val = obs.find('hl7:value', NS)
-            if val is None: 
-                continue
+            if val is None: continue
             u = (val.attrib.get('unit') or '').strip().lower()
             if u in {'cm','m','in'}:
                 h_val = (val.attrib.get('value') or '').strip()
                 h_unit = (val.attrib.get('unit') or '').strip()
-                if h_val:
-                    break
+                if h_val: break
     height = ""
     if clean_value(h_val):
         height = clean_value(h_val)
@@ -320,7 +310,7 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
         "Patient Record Number": clean_value(patient_record_no),
     }
 
-# ---------------- Products extraction (ALL; group by COMPONENT into regimens) ----------------
+# ---------------- Products extraction (ALL; group by COMPONENT; NO REGIMEN) ----------------
 def extract_suspect_ids(root: ET.Element) -> Set[str]:
     out = set()
     for c in findall(root, './/hl7:causalityAssessment'):
@@ -383,7 +373,6 @@ def _iter_drug_components(root: ET.Element) -> List[ET.Element]:
     """
     Return all <component typeCode="COMP"> elements that contain at least one
     <substanceAdministration classCode="SBADM" moodCode="EVN"> anywhere inside.
-    Order is document order.
     """
     comps = []
     for comp in root.findall('.//hl7:component[@typeCode="COMP"]', NS):
@@ -392,26 +381,35 @@ def _iter_drug_components(root: ET.Element) -> List[ET.Element]:
             comps.append(comp)
     return comps
 
+def _add_unique(acc_list: List[str], value: str):
+    v = clean_value(value)
+    if not v:
+        return
+    if v not in acc_list:
+        acc_list.append(v)
+
 def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
     """
-    GROUP BY COMPONENT:
+    GROUP BY COMPONENT (NO REGIMENS):
       - Each <component typeCode="COMP"> that contains SBADM/EVN is ONE drug block.
-      - Inside that component, every SBADM/EVN is ONE regimen for that same drug.
-      - pid is from the FIRST SBADM's <id@root> in the component (if present).
-      - Title is the FIRST resolvable name from any SBADM; fallback to pid; else "comp::<seq>".
+      - Start at the first SBADM's <id root="..."> inside that component; collect ALL details
+        from all SBADMs in the component into a single drug record.
+      - Title = first resolvable product name in the component; else pid; else "comp::<seq>".
+      - For fields that can repeat, aggregate unique values (order preserved), joined by newline.
     """
     suspects   = extract_suspect_ids(root)
     interact   = extract_interacting_ids(root)
     treatments = extract_treatment_ids(root)
 
-    flat: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
     comps = _iter_drug_components(root)
 
     for cidx, comp in enumerate(comps, start=1):
-        # All SBADM (EVN) within this component
         sas = comp.findall('.//hl7:substanceAdministration[@classCode="SBADM"][@moodCode="EVN"]', NS)
+        if not sas:
+            continue
 
-        # FIRST pid of the component (from the first SBADM that has <id>)
+        # FIRST pid in this component
         pid = ""
         for sa in sas:
             id_el = find_first(sa, './/hl7:id')
@@ -419,7 +417,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
                 pid = id_el.attrib.get('root').strip()
                 break
 
-        # Resolve component title: first non-empty product name from any SBADM; else pid; else synthetic
+        # Title
         title = ""
         for sa in sas:
             nm = _resolve_drug_name(sa).strip()
@@ -428,33 +426,55 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
         if not title:
             title = pid or f"comp::{cidx:03d}"
 
-        # Classification tags at drug level using pid
-        drug_tags = set()
-        if pid and pid in suspects:   drug_tags.add("Suspect")
-        if pid and pid in interact:   drug_tags.add("Interacting")
-        if pid and pid in treatments: drug_tags.add("Treatment")
-        if not drug_tags:             drug_tags.add("Concomitant")
+        # Classification at drug level using pid
+        tags = set()
+        if pid and pid in suspects:   tags.add("Suspect")
+        if pid and pid in interact:   tags.add("Interacting")
+        if pid and pid in treatments: tags.add("Treatment")
+        if not tags:                  tags.add("Concomitant")
+        type_disp = ", ".join(sorted(tags))
 
-        # Build regimens (one per SBADM inside this component)
-        regimens: List[Dict[str, Any]] = []
+        # Aggregated fields
+        agg = {
+            "Dosage Text": [],
+            "Dose Value": [],
+            "Dose Unit": [],
+            "Start Date": [],
+            "Stop Date": [],
+            "Route": [],
+            "Formulation": [],
+            "Lot No": [],
+            "MAH": [],
+        }
+
         for sa in sas:
             txt = get_text(find_first(sa, './/hl7:text'))
+            _add_unique(agg["Dosage Text"], txt)
+
             dq = find_first(sa, './/hl7:doseQuantity')
-            dose_v = dq.attrib.get('value','') if dq is not None else ''
-            dose_u = dq.attrib.get('unit','') if dq is not None else ''
+            if dq is not None:
+                _add_unique(agg["Dose Value"], dq.attrib.get('value', ''))
+                _add_unique(agg["Dose Unit"],  dq.attrib.get('unit', ''))
 
             low  = find_first(sa, './/hl7:effectiveTime/hl7:low')
             high = find_first(sa, './/hl7:effectiveTime/hl7:high')
-            sd_raw = (low.attrib.get('value') or '').strip() if low is not None else ''
-            ed_raw = (high.attrib.get('value') or '').strip() if high is not None else ''
+            sd = format_date((low.attrib.get('value') or '').strip() if low is not None else '')
+            ed = format_date((high.attrib.get('value') or '').strip() if high is not None else '')
+            _add_unique(agg["Start Date"], sd)
+            _add_unique(agg["Stop Date"],  ed)
 
             rtxt = get_text(find_first(sa, './/hl7:routeCode/hl7:originalText'))
             if not rtxt:
                 rc = find_first(sa, './/hl7:routeCode')
                 rtxt = (rc.attrib.get('displayName') or '') if rc is not None else ''
+            _add_unique(agg["Route"], rtxt)
 
             form = get_text(find_first(sa, './/hl7:formCode/hl7:originalText'))
+            _add_unique(agg["Formulation"], form)
+
             lot  = get_text(find_first(sa, './/hl7:lotNumberText'))
+            _add_unique(agg["Lot No"], lot)
+
             mah  = ""
             for p in [
                 './/hl7:playingOrganization/hl7:name',
@@ -464,35 +484,29 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
                 node = find_first(sa, p)
                 if node is not None and get_text(node):
                     mah = get_text(node); break
+            _add_unique(agg["MAH"], mah)
 
-            regimens.append({
-                "Type": ", ".join(sorted(drug_tags)),  # drug-level classification shown per regimen
-                "Dosage Text": clean_value(txt),
-                "Dose Value": clean_value(dose_v),
-                "Dose Unit": clean_value(dose_u),
-                "Start Date (raw)": sd_raw, "Start Date": format_date(sd_raw),
-                "Stop Date (raw)": ed_raw, "Stop Date": format_date(ed_raw),
-                "Route": clean_value(rtxt),
-                "Formulation": clean_value(form),
-                "Lot No": clean_value(lot),
-                "MAH": clean_value(mah),
-            })
+        # Join values with newline for display
+        def join_vals(lst: List[str]) -> str:
+            return "\n".join([v for v in lst if has_value(v)])
 
-        # (Optional) de-duplicate identical regimen rows inside this component
-        regimens = _dedupe_regimens(regimens)
+        out.append({
+            "Drug": title,
+            "Type": type_disp,
+            "Dosage Text": join_vals(agg["Dosage Text"]),
+            "Dose Value":   join_vals(agg["Dose Value"]),
+            "Dose Unit":    join_vals(agg["Dose Unit"]),
+            "Start Date":   join_vals(agg["Start Date"]),
+            "Stop Date":    join_vals(agg["Stop Date"]),
+            "Route":        join_vals(agg["Route"]),
+            "Formulation":  join_vals(agg["Formulation"]),
+            "Lot No":       join_vals(agg["Lot No"]),
+            "MAH":          join_vals(agg["MAH"]),
+            "_gid": f"pid::{pid.lower()}" if pid else f"comp::{cidx:03d}",
+            "_pid": pid or "",
+        })
 
-        # Flatten (one record per regimen) with grouping key = component/pid
-        gid = f"pid::{pid.lower()}" if pid else f"comp::{cidx:03d}"
-        for ridx, reg in enumerate(regimens, start=1):
-            flat.append({
-                "Drug": title,
-                **reg,
-                "_gid": gid,
-                "_pid": pid or "",
-                "_regimen_no": ridx,
-            })
-
-    return flat
+    return out
 
 # ---------------- Reporter extraction (STRICT: only sourceReport branches) ----------------
 def build_parent_map(root: ET.Element) -> Dict[ET.Element, ET.Element]:
@@ -574,9 +588,8 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
             qual = REPORTER_MAP.get(c, c); break
     result["Reporter Qualification"] = qual
 
-    # Name parts (Title/Prefix, Given, Family) — mask-aware
+    # Name parts — mask-aware
     name_el = node.find('.//hl7:assignedPerson/hl7:name', NS) or node.find('.//hl7:name', NS)
-
     title_vals, given_vals, family_val = [], [], ""
     if name_el is not None:
         for pfx in name_el.findall('hl7:prefix', NS):
@@ -660,7 +673,7 @@ def extract_reporters_from_sourceReport(root: ET.Element) -> List[Dict[str, str]
             reporters.append(rep)  # sequential; no matching
     return reporters
 
-# ---------------- Events extraction (aligned with your app.py) ----------------
+# ---------------- Events extraction (aligned with app.py logic) ----------------
 def extract_events(root: ET.Element, debug: bool = False) -> List[Dict[str, Any]]:
     seriousness_map = {
         "resultsInDeath": "Death",
@@ -822,27 +835,16 @@ def make_patient_table(src_pat: Dict[str,str], prc_pat: Dict[str,str]) -> pd.Dat
     rows = [(f, src_pat.get(f,""), prc_pat.get(f,"")) for f in fields]
     return compare_table(rows, treat_as_dates=False)
 
-# ------ Drug UI helpers: group by _gid (component/pid), de-dup identical regimens ------
-def group_products_by_gid(products: List[Dict[str,Any]]) -> Dict[str, List[Dict[str,Any]]]:
-    groups: Dict[str, List[Dict[str,Any]]] = {}
+# ------ Drug UI helpers (NO REGIMENS) ------
+def index_by_gid(products: List[Dict[str,Any]]) -> Dict[str, Dict[str,Any]]:
+    idx: Dict[str, Dict[str,Any]] = {}
     for rec in products:
-        k = rec.get("_gid") or "comp::000"
-        groups.setdefault(k, []).append(rec)
-    return groups
+        gid = rec.get("_gid") or ""
+        if gid and gid not in idx:
+            idx[gid] = rec
+    return idx
 
-def _dedupe_regimens(regs: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
-    seen = set()
-    out  = []
-    keep_fields = ("Type","Dosage Text","Dose Value","Dose Unit","Start Date","Stop Date","Route","Formulation","Lot No","MAH")
-    for r in regs:
-        sig = tuple((r.get(f,"") or "") for f in keep_fields)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        out.append(r)
-    return out
-
-def make_regimen_pair_table(src_rec: Dict[str,Any], prc_rec: Dict[str,Any]) -> pd.DataFrame:
+def make_drug_compare_table(src_rec: Dict[str,Any], prc_rec: Dict[str,Any]) -> pd.DataFrame:
     fields = [
         "Type",
         "Dosage Text",
@@ -856,14 +858,9 @@ def make_regimen_pair_table(src_rec: Dict[str,Any], prc_rec: Dict[str,Any]) -> p
         "MAH",
     ]
     rows = []
-    for field in fields:
-        s_val = src_rec.get(field, "")
-        p_val = prc_rec.get(field, "")
-        if "Date" in field:
-            s_val = s_val or format_date(src_rec.get(field + " (raw)", ""))
-            p_val = p_val or format_date(prc_rec.get(field + " (raw)", ""))
-        rows.append((field, s_val, p_val))
-    return compare_table(rows, treat_as_dates=True)
+    for f in fields:
+        rows.append((f, src_rec.get(f,""), prc_rec.get(f,"")))
+    return compare_table(rows, treat_as_dates=False)
 
 # --------------- UI: Upload & Parse ----------------
 st.markdown("### 📤 Upload the two XML files you want to compare (no ID pairing; exact files compared)")
@@ -925,64 +922,39 @@ if not pat_df.empty:
 else:
     st.markdown('<div class="box smallnote">No patient values present in either file.</div>', unsafe_allow_html=True)
 
-# ---------------- SECTION: Drug Details (ALL products; grouped by COMPONENT; regimen-wise) ----------------
-st.subheader("Drug Details (all products) — grouped by component; regimen-wise")
+# ---------------- SECTION: Drug Details (ALL products; grouped by COMPONENT; NO REGIMENS) ----------------
+st.subheader("Drug Details (all products) — one block per component")
 
 src_prods = src.get("Products", [])
 prc_prods = prc.get("Products", [])
 
-# Group and de-duplicate identical regimens per product
-src_groups_raw = group_products_by_gid(src_prods)
-prc_groups_raw = group_products_by_gid(prc_prods)
-src_groups = {k: _dedupe_regimens(v) for k, v in src_groups_raw.items()}
-prc_groups = {k: _dedupe_regimens(v) for k, v in prc_groups_raw.items()}
+src_idx = index_by_gid(src_prods)
+prc_idx = index_by_gid(prc_prods)
 
-# preserve order: src order first, then processed-only groups in their order
-all_group_keys = []
-seen = set()
-for k in list(src_groups_raw.keys()) + list(prc_groups_raw.keys()):
-    if k not in seen:
-        seen.add(k); all_group_keys.append(k)
+# preserve order: src first in encounter order (as produced), then processed-only
+ordered_gids: List[str] = []
+for rec in src_prods:
+    g = rec.get("_gid")
+    if g and g not in ordered_gids:
+        ordered_gids.append(g)
+for rec in prc_prods:
+    g = rec.get("_gid")
+    if g and g not in ordered_gids:
+        ordered_gids.append(g)
 
-if not all_group_keys:
+if not ordered_gids:
     st.markdown('<div class="box smallnote">No products found in either file.</div>', unsafe_allow_html=True)
 else:
-    for gkey in all_group_keys:
-        s_list = src_groups.get(gkey, [])
-        p_list = prc_groups.get(gkey, [])
-
-        # Title from any non-empty name; fallback to PID; fallback synthetic
-        title = ""
-        for lst in (s_list, p_list):
-            for rec in lst:
-                if rec.get("Drug"):
-                    title = rec["Drug"]; break
-            if title: break
-        if not title:
-            pid_hint = ""
-            for lst in (s_list, p_list):
-                for rec in lst:
-                    if rec.get("_pid"):
-                        pid_hint = rec["_pid"]; break
-                if pid_hint: break
-            title = pid_hint or "(Unnamed drug)"
-
+    for gid in ordered_gids:
+        srec = src_idx.get(gid, {})
+        prec = prc_idx.get(gid, {})
+        title = srec.get("Drug") or prec.get("Drug") or (srec.get("_pid") or prec.get("_pid") or "(Unnamed drug)")
         st.markdown(f'<div class="box"><h5>Drug: {title}</h5>', unsafe_allow_html=True)
-
-        n_reg = max(len(s_list), len(p_list))
-        if n_reg == 0:
-            st.markdown('<div class="smallnote">No regimens present in either file for this drug.</div>', unsafe_allow_html=True)
+        d_df = make_drug_compare_table(srec, prec)
+        if d_df.empty:
+            st.markdown('<div class="smallnote">No values to display for this drug in either file.</div>', unsafe_allow_html=True)
         else:
-            for idx in range(n_reg):
-                srec = s_list[idx] if idx < len(s_list) else {}
-                prec = p_list[idx] if idx < len(p_list) else {}
-                st.markdown(f"**Regimen #{idx+1}**")
-                d_df = make_regimen_pair_table(srec, prec)
-                if d_df.empty:
-                    st.markdown('<div class="smallnote">No values to display for this regimen in either file.</div>', unsafe_allow_html=True)
-                else:
-                    st.table(d_df)
-                st.markdown("---")
+            st.table(d_df)
         st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------------- SECTION: Event Details — matched by LLT code (fallback normalized term) ----------------
@@ -1063,49 +1035,21 @@ for i in range(max(len(src_reps), len(prc_reps))):
     r_df = make_reporter_pair_table(srep, prep)
     reporter_rows += rows_from_table(r_df, "Reporter", group=title)
 
-# Drugs sheet (flatten all products & regimens, grouped by _gid)
+# Drugs sheet (flatten — NO REGIMENS; one block per component)
 drug_rows = []
-# maintain same group ordering as UI
-for gkey in all_group_keys:
-    s_list = src_groups.get(gkey, [])
-    p_list = prc_groups.get(gkey, [])
-    # Title
-    title = ""
-    for lst in (s_list, p_list):
-        for rec in lst:
-            if rec.get("Drug"):
-                title = rec["Drug"]; break
-        if title: break
-    if not title:
-        pid_hint = ""
-        for lst in (s_list, p_list):
-            for rec in lst:
-                if rec.get("_pid"):
-                    pid_hint = rec["_pid"]; break
-            if pid_hint: break
-        title = pid_hint or "(Unnamed drug)"
-
-    n_reg = max(len(s_list), len(p_list))
-    for idx in range(n_reg):
-        srec = s_list[idx] if idx < len(s_list) else {}
-        prec = p_list[idx] if idx < len(p_list) else {}
-        group_name = f"{title} — Regimen #{idx+1}"
-        for field in ["Type","Dosage Text","Dose Value","Dose Unit","Start Date","Stop Date","Route","Formulation","Lot No","MAH"]:
-            s_val = srec.get(field, "") or (format_date(srec.get(field + " (raw)","")) if "Date" in field else "")
-            p_val = prec.get(field, "") or (format_date(prec.get(field + " (raw)","")) if "Date" in field else "")
-            if has_value(s_val) or has_value(p_val):
-                drug_rows.append({"Section":"Drug", "Group": group_name, "Field": field, "Source": s_val or "—", "Processed": p_val or "—"})
+for gid in ordered_gids:
+    srec = src_idx.get(gid, {})
+    prec = prc_idx.get(gid, {})
+    group_title = srec.get("Drug") or prec.get("Drug") or (srec.get("_pid") or prec.get("_pid") or "(Unnamed drug)")
+    for field in ["Type","Dosage Text","Dose Value","Dose Unit","Start Date","Stop Date","Route","Formulation","Lot No","MAH"]:
+        s_val = srec.get(field, "")
+        p_val = prec.get(field, "")
+        if has_value(s_val) or has_value(p_val):
+            drug_rows.append({"Section":"Drug", "Group": group_title, "Field": field, "Source": s_val or "—", "Processed": p_val or "—"})
 
 # Events sheet (flatten; include processed-only too)
-src_evts = src.get("Events", [])
-prc_evts = prc.get("Events", [])
-def _idx_events_for_export(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
-    return {e.get("_key",""): e for e in lst if e.get("_key","")}
-src_evt_idx = _idx_events_for_export(src_evts)
-prc_evt_idx = _idx_events_for_export(prc_evts)
-
 event_rows = []
-for key in sorted(set(src_evt_idx) | set(prc_evt_idx)):
+for key in all_evt_keys:
     se = src_evt_idx.get(key, {})
     pe = prc_evt_idx.get(key, {})
     title = se.get("LLT Term") or se.get("LLT Code") or pe.get("LLT Term") or pe.get("LLT Code") or "(Unnamed event)"
