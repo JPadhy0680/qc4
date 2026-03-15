@@ -58,8 +58,8 @@ ACTION_TAKEN_MAP = {
 MEDDRA_LLT_OID = "2.16.840.1.113883.6.163"  # LLT codes in observations
 MH_SECTION_OID = "2.16.840.1.113883.3.989.2.1.1.20"  # clinical sections (MH, Labs, etc.)
 STATUS_OID = "2.16.840.1.113883.3.989.2.1.1.19"  # status & flags; includes 'causality'(39) and 'interventionCharacterization'(20)
-INTERVENTION_CHAR_CODE = "20"  # observed in your snippet for interventionCharacterization
-CAUSALITY_CODE = "39"          # for causality
+INTERVENTION_CHAR_CODE = "20"  # interventionCharacterization
+CAUSALITY_CODE = "39"          # causality
 
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
 TD_PATHS = [
@@ -496,7 +496,7 @@ def build_reaction_id_to_term(root: ET.Element, meddra_map: Optional[Dict[str, D
     Map reaction OBS id (root/extension) -> LLT term for observations with code displayName='reaction'.
     """
     out: Dict[str, str] = {}
-    for obs in findall(root, './/hl7:observation[@classCode="OBS"][@moodCode="EVN"]'):
+    for obs in findall(root, './/hl7:observation'):
         code_el = obs.find('hl7:code', NS)
         if code_el is None or (code_el.attrib.get('displayName') or '').strip().lower() != 'reaction':
             continue
@@ -537,7 +537,7 @@ def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dic
 
     for anc in anchors:
         container = pmap.get(anc, None) or root
-        for obs in container.findall('.//hl7:observation[@classCode="OBS"][@moodCode="EVN"]', NS):
+        for obs in container.findall('.//hl7:observation', NS):
             code = obs.find('hl7:code', NS)
             if code is None:
                 continue
@@ -615,7 +615,7 @@ def extract_labs(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]
 
     for anc in anchors:
         container = pmap.get(anc, None) or root
-        for obs in container.findall('.//hl7:observation[@classCode="OBS"][@moodCode="EVN"]', NS):
+        for obs in container.findall('.//hl7:observation', NS):
             code = obs.find('hl7:code', NS)
             if code is None or (code.attrib.get('codeSystem') or '').strip() != MEDDRA_LLT_OID:
                 continue
@@ -682,18 +682,13 @@ def extract_labs(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str,str]]
         st.info("No lab details parsed from expected section.")
     return items
 
-# ---------------- Causality extraction (intervention-aware, name-resolved) ----------------
+# ---------------- Causality extraction (relaxed filters, improved assessor) ----------------
 def _iter_components_in_doc_order(root: ET.Element) -> List[ET.Element]:
     """Return all component nodes in document order."""
     return findall(root, './/hl7:component[@typeCode="COMP"]')
 
 def _resolve_intervention_label(val_node: Optional[ET.Element]) -> str:
-    """
-    Best-effort label from <value> for interventionCharacterization:
-    - prefer @displayName
-    - else if @code present -> "code:<code>"
-    - else text content / originalText
-    """
+    """Best-effort label from <value> for interventionCharacterization."""
     if val_node is None:
         return ""
     dsn = (val_node.attrib.get('displayName') or '').strip()
@@ -707,6 +702,49 @@ def _resolve_intervention_label(val_node: Optional[ET.Element]) -> str:
         return ot.text.strip()
     return get_text(val_node)
 
+def _extract_assessor_label(node: ET.Element) -> str:
+    """
+    Prefer code/originalText or code@displayName/@code under assignedEntity/assignedAuthor.
+    Fallback to name/originalText.
+    """
+    cand_texts: List[str] = []
+    for xp in [
+        './/hl7:author//hl7:assignedEntity//hl7:code/hl7:originalText',
+        './/hl7:author//hl7:assignedAuthor//hl7:code/hl7:originalText',
+    ]:
+        el = find_first(node, xp)
+        if el is not None and (el.text or '').strip():
+            cand_texts.append(el.text.strip())
+    for xp in [
+        './/hl7:author//hl7:assignedEntity//hl7:code',
+        './/hl7:author//hl7:assignedAuthor//hl7:code',
+    ]:
+        el = find_first(node, xp)
+        if el is not None:
+            for attr in ('displayName', 'code'):
+                v = (el.attrib.get(attr) or '').strip()
+                if v:
+                    cand_texts.append(v)
+
+    # Canonicalize if we spot “Company” or “Reporter” explicitly
+    for t in cand_texts:
+        low = t.lower()
+        if 'company' in low:
+            return "Company"
+        if 'reporter' in low:
+            return "Reporter"
+
+    # Fallbacks
+    nm = find_first(node, './/hl7:author//hl7:assignedEntity//hl7:name')
+    if nm is not None and get_text(nm):
+        return get_text(nm)
+    ot = find_first(node, './/hl7:author//hl7:assignedEntity//hl7:originalText')
+    if ot is not None and get_text(ot):
+        return get_text(ot)
+
+    # Last fallback: if we saw any code text, surface first
+    return cand_texts[0] if cand_texts else ""
+
 def extract_causality(
     root: ET.Element,
     product_id_to_name: Optional[Dict[str, str]] = None,
@@ -714,25 +752,20 @@ def extract_causality(
     debug: bool = False
 ) -> List[Dict[str, Any]]:
     """
-    Intervention-aware causality extraction:
-    For each <component typeCode="COMP">:
-    - Iterate child <causalityAssessment> in document order.
-    - When codeSystem=STATUS_OID and displayName='interventionCharacterization' (or code='20'):
-      set current_intervention = resolved label from <value>.
-    - When codeSystem=STATUS_OID and displayName='causality' (or code='39'):
-      emit a causality row enriched with current_intervention (until reset by next interventionCharacterization).
-
-    Fixes:
-    - Assessment now robustly reads ST text when @value is absent.
-    - Assessor prefers author/assignedEntity(or assignedAuthor)/code/originalText ("Company"/"Reporter") before fallbacks.
+    Intervention-aware causality extraction (RELAXED):
+      - Scan all <causalityAssessment> within each component (no classCode/moodCode filter).
+      - Track last 'interventionCharacterization' (code=20) sentinel in the component.
+      - For causality (code=39 or displayName='causality' within STATUS_OID), emit result row.
+      - Assessment reads ST text when @value missing.
+      - Assessor reads from assignedEntity/assignedAuthor code nodes first (Company/Reporter).
     """
     out: List[Dict[str, Any]] = []
     try:
         for comp in _iter_components_in_doc_order(root):
             current_intervention = ""  # resets per component
 
-            # find all causalityAssessment under this component in doc order
-            ca_nodes = comp.findall('.//hl7:causalityAssessment[@classCode="OBS"][@moodCode="EVN"]', NS)
+            # NOTE: relaxed — include ALL causalityAssessment nodes
+            ca_nodes = comp.findall('.//hl7:causalityAssessment', NS)
             for node in ca_nodes:
                 ccode = node.find('hl7:code', NS)
                 if ccode is None:
@@ -744,12 +777,12 @@ def extract_causality(
                 if cs != STATUS_OID:
                     continue
 
-                # --- Intervention Characterization sentinel
+                # ---- Intervention Characterization sentinel
                 if dsn == 'interventioncharacterization' or cd == INTERVENTION_CHAR_CODE:
                     current_intervention = _resolve_intervention_label(find_first(node, './/hl7:value'))
-                    continue  # not a result row itself
+                    continue  # not a result row
 
-                # --- Causality result rows
+                # ---- Causality rows
                 if not (cd == CAUSALITY_CODE or dsn == 'causality'):
                     continue
 
@@ -764,23 +797,8 @@ def extract_causality(
                 # Method
                 method = get_text(find_first(node, './/hl7:methodCode/hl7:originalText'))
 
-                # Assessor: prefer assignedEntity/assignedAuthor -> code/originalText
-                assessor = ""
-                pref_paths = [
-                    './/hl7:author//hl7:assignedEntity//hl7:code/hl7:originalText',
-                    './/hl7:author//hl7:assignedAuthor//hl7:code/hl7:originalText',
-                ]
-                for xp in pref_paths:
-                    aot = find_first(node, xp)
-                    if aot is not None and (aot.text or '').strip():
-                        assessor = aot.text.strip()
-                        break
-                if not assessor:
-                    nm = find_first(node, './/hl7:author//hl7:assignedEntity//hl7:name')
-                    if nm is not None:
-                        assessor = get_text(nm)
-                    if not assessor:
-                        assessor = get_text(find_first(node, './/hl7:author//hl7:assignedEntity//hl7:originalText'))
+                # Assessor (improved)
+                assessor = _extract_assessor_label(node)
 
                 # References
                 evt_id = ""
@@ -792,20 +810,18 @@ def extract_causality(
                 if prd is not None:
                     prd_id = (prd.attrib.get('root') or '').strip() or (prd.attrib.get('extension') or '').strip()
 
-                # Resolve Reaction
+                # Resolve Reaction & Drug names
                 reaction_name = reaction_id_to_term.get(evt_id, "") if (reaction_id_to_term and evt_id) else ""
-
-                # Resolve Drug
                 drug_name = product_id_to_name.get(prd_id, "") if (product_id_to_name and prd_id) else ""
                 if not drug_name:
                     # fallback to the nearest component's first SBADM
-                    sa = comp.find('.//hl7:substanceAdministration[@classCode="SBADM"][@moodCode="EVN"]', NS)
+                    sa = comp.find('.//hl7:substanceAdministration', NS)
                     if sa is not None:
                         nm_txt = _resolve_drug_name(sa).strip()
                         if nm_txt:
                             drug_name = nm_txt
 
-                # Internal key for pairing
+                # Stable key
                 key = (evt_id or "") + "::" + (prd_id or "")
                 if not key.strip(":"):
                     key = "assess::" + normalize_text(assessment or "") + "::" + normalize_text(method or "") + "::" + normalize_text(current_intervention or "")
@@ -813,14 +829,26 @@ def extract_causality(
                 out.append({
                     "Assessment": clean_value(assessment),
                     "Method": clean_value(method),
-                    "Assessor": clean_value(assessor),
+                    "Assessor": clean_value(assessor),  # ↤ should show Company/Reporter now
                     "Reaction": clean_value(reaction_name),
                     "Drug": clean_value(drug_name),
                     "Intervention Characterization": clean_value(current_intervention),
-                    "_key": key,  # internal pairing only
-                    "_evt_id": evt_id,  # internal; not displayed
-                    "_prd_id": prd_id,  # internal; not displayed
+                    "_key": key,
+                    "_evt_id": evt_id,
+                    "_prd_id": prd_id,
                 })
+
+        if debug:
+            st.info(f"Causality parsed rows: {len(out)}")
+            if out:
+                st.write(pd.DataFrame([{
+                    "Assessor": r.get("Assessor",""),
+                    "Assessment": r.get("Assessment",""),
+                    "Method": r.get("Method",""),
+                    "Reaction": r.get("Reaction",""),
+                    "Drug": r.get("Drug",""),
+                    "Intervention": r.get("Intervention Characterization","")
+                } for r in out]))
     except Exception as e:
         if debug:
             st.warning(f"Causality parse error: {e}")
@@ -888,7 +916,7 @@ def _resolve_drug_name(admin: ET.Element) -> str:
 def _iter_drug_components(root: ET.Element) -> List[ET.Element]:
     comps = []
     for comp in root.findall('.//hl7:component[@typeCode="COMP"]', NS):
-        sas = comp.findall('.//hl7:substanceAdministration[@classCode="SBADM"][@moodCode="EVN"]', NS)
+        sas = comp.findall('.//hl7:substanceAdministration', NS)
         if sas:
             comps.append(comp)
     return comps
@@ -908,7 +936,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     comps = _iter_drug_components(root)
     for cidx, comp in enumerate(comps, start=1):
-        sas = comp.findall('.//hl7:substanceAdministration[@classCode="SBADM"][@moodCode="EVN"]', NS)
+        sas = comp.findall('.//hl7:substanceAdministration', NS)
         if not sas:
             continue
 
@@ -1325,7 +1353,7 @@ def extract_model(xml_bytes: bytes, meddra_map: Optional[Dict[str, Dict[str,str]
                            for p in products if (p.get("_pid") or "").strip() }
     reaction_id_to_term = build_reaction_id_to_term(root, meddra_map=meddra_map)
 
-    # Causality with intervention-awareness, name resolution & OID filter
+    # Causality with intervention-awareness, name resolution & relaxed node filter
     model["Causality"] = extract_causality(
         root,
         product_id_to_name=product_id_to_name,
@@ -1492,7 +1520,7 @@ def _idx_mh(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
     return {e.get("_key",""): e for e in lst if e.get("_key","")}
 src_mh_idx = _idx_mh(src_mh)
 prc_mh_idx = _idx_mh(prc_mh)
-all_mh_keys = sorted(set(src_mh_idx) | set(prc_mh_idx))  # fixed union
+all_mh_keys = sorted(set(src_mh_idx) | set(prc_mh_idx))
 
 def make_mh_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
     st.markdown(f'<div class="box"><h5>Medical History: {title}</h5>', unsafe_allow_html=True)
@@ -1538,7 +1566,7 @@ def _idx_lab(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
     return {e.get("_key",""): e for e in lst if e.get("_key","")}
 src_lab_idx = _idx_lab(src_lab)
 prc_lab_idx = _idx_lab(prc_lab)
-all_lab_keys = sorted(set(src_lab_idx) | set(prc_lab_idx))  # fixed union
+all_lab_keys = sorted(set(src_lab_idx) | set(prc_lab_idx))
 
 def make_lab_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
     st.markdown(f'<div class="box"><h5>Lab: {title}</h5>', unsafe_allow_html=True)
@@ -1588,7 +1616,7 @@ def _key_caus(item: Dict[str,Any]) -> str:
     return k
 src_caus_idx = { _key_caus(i): i for i in src_caus }
 prc_caus_idx = { _key_caus(i): i for i in prc_caus }
-all_caus_keys = sorted(set(src_caus_idx) | set(prc_caus_idx))  # fixed union
+all_caus_keys = sorted(set(src_caus_idx) | set(prc_caus_idx))
 
 def make_caus_box_for_ui(s: Dict[str,Any], p: Dict[str,Any], title_hint: str):
     st.markdown(f'<div class="box"><h5>Causality: {title_hint}</h5>', unsafe_allow_html=True)
@@ -1622,7 +1650,7 @@ else:
         make_caus_box_for_ui(se, pe, title)
 
 # ---------------- SECTION: Drug Details (ALL products; grouped by COMPONENT; NO REGIMENS) ----------------
-st.subheader("Drug Details (all products) — matched by name → pid → gid")
+st.subheader("Drug Details (all products) — matched by name → pid → gid)")
 src_prods = src.get("Products", [])
 prc_prods = prc.get("Products", [])
 
@@ -1671,7 +1699,7 @@ def _idx_events(lst: List[Dict[str,Any]]) -> Dict[str,Dict[str,Any]]:
     return {e.get("_key",""): e for e in lst if e.get("_key","")}
 src_evt_idx = _idx_events(src_evts)
 prc_evt_idx = _idx_events(prc_evts)
-all_evt_keys = sorted(set(src_evt_idx) | set(prc_evt_idx))  # fixed union
+all_evt_keys = sorted(set(src_evt_idx) | set(prc_evt_idx))
 
 def make_event_box_for_ui(src_rec: Dict[str,Any], prc_rec: Dict[str,Any], title: str):
     st.markdown(f'<div class="box"><h5>Event: {title}</h5>', unsafe_allow_html=True)
