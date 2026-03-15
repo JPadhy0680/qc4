@@ -891,7 +891,9 @@ def extract_reporter_from_container(node: ET.Element) -> Dict[str, str]:
     streets, city, state, postal, country = [], "", "", "", ""
     if addr is not None:
         for sl in addr.findall('hl7:streetAddressLine', NS):
-            val = read_text_or_mask(sl);  if val: streets.append(val)
+            val = read_text_or_mask(sl);  
+            if val: 
+                    streets.append(val)
         city   = read_text_or_mask(addr.find('hl7:city', NS))
         state  = read_text_or_mask(addr.find('hl7:state', NS))
         postal = read_text_or_mask(addr.find('hl7:postalCode', NS))
