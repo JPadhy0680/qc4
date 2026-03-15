@@ -42,6 +42,17 @@ AGE_OID            = "2.16.840.1.113883.3.989.2.1.1.19"
 # Patient: Record Number OID
 PATIENT_RECORD_OID = "2.16.840.1.113883.3.989.2.1.3.7"
 
+# ---- Action Taken ----
+ACTION_TAKEN_OID = "2.16.840.1.113883.3.989.2.1.1.15"
+ACTION_TAKEN_MAP = {
+    "1": "Drug withdrawn",
+    "2": "Dose reduced",
+    "3": "Dose increased",
+    "4": "Dose not changed",
+    "0": "Unknown",
+    "9": "Not applicable",
+}
+
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
 TD_PATHS = [
     './/hl7:transmissionWrapper/hl7:creationTime',
@@ -406,6 +417,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
         from all SBADMs in the component into a single drug record.
       - Title = first resolvable product name in the component; else pid; else "comp::<seq>".
       - For fields that can repeat, aggregate unique values (order preserved), joined by newline.
+      - Action Taken collected from <act ACT/EVN><code codeSystem=ACTION_TAKEN_OID code="..."/>.
     """
     suspects   = extract_suspect_ids(root)
     interact   = extract_interacting_ids(root)
@@ -455,6 +467,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
             "Formulation": [],
             "Lot No": [],
             "MAH": [],
+            "Action Taken": [],
         }
 
         for sa in sas:
@@ -496,6 +509,14 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
                     mah = get_text(node); break
             _add_unique(agg["MAH"], mah)
 
+        # ---- Action Taken (scan inside this component)
+        for act_code in comp.findall('.//hl7:act[@classCode="ACT"][@moodCode="EVN"]/hl7:code', NS):
+            if (act_code.attrib.get('codeSystem') or '').strip() == ACTION_TAKEN_OID:
+                c = (act_code.attrib.get('code') or '').strip()
+                label = ACTION_TAKEN_MAP.get(c, c or "")
+                if label:
+                    _add_unique(agg["Action Taken"], label)
+
         # Join values with newline for display
         def join_vals(lst: List[str]) -> str:
             return "\n".join([v for v in lst if has_value(v)])
@@ -512,6 +533,7 @@ def extract_all_products(root: ET.Element) -> List[Dict[str, Any]]:
             "Formulation":  join_vals(agg["Formulation"]),
             "Lot No":       join_vals(agg["Lot No"]),
             "MAH":          join_vals(agg["MAH"]),
+            "Action Taken": join_vals(agg["Action Taken"]),
             "_gid": f"pid::{pid.lower()}" if pid else f"comp::{cidx:03d}",
             "_pid": pid or "",
         })
@@ -886,6 +908,7 @@ def make_drug_compare_table(src_rec: Dict[str,Any], prc_rec: Dict[str,Any]) -> p
         "Formulation",
         "Lot No",
         "MAH",
+        "Action Taken",
     ]
     rows = []
     for f in fields:
@@ -1002,7 +1025,7 @@ else:
             st.table(d_df)
         st.markdown('</div>', unsafe_allow_html=True)
 
-# ---------------- SECTION: Event Details — matched by LLT code (fallback normalized term) ----------------
+# ---------------- SECTION: Event Details — matched by LLT code (fallback: normalized term) ----------------
 st.subheader("Event Details — matched by LLT code (fallback: normalized term)")
 src_evts = src.get("Events", [])
 prc_evts = prc.get("Events", [])
@@ -1092,7 +1115,7 @@ for key in ordered_keys:
         or (prec.get("_pid") or "").strip()
         or "(Unnamed drug)"
     )
-    for field in ["Type","Dosage Text","Dose Value","Dose Unit","Start Date","Stop Date","Route","Formulation","Lot No","MAH"]:
+    for field in ["Type","Dosage Text","Dose Value","Dose Unit","Start Date","Stop Date","Route","Formulation","Lot No","MAH","Action Taken"]:
         s_val = srec.get(field, "")
         p_val = prec.get(field, "")
         if has_value(s_val) or has_value(p_val):
