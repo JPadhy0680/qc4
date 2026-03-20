@@ -481,8 +481,8 @@ dod = format_date(dod_raw)
         "Weight": clean_value(weight),
         "Initials": clean_value(initials),
         "Patient Record Number": clean_value(patient_record_no),
-    "DOB": clean_value(dob),
-    "DOD": clean_value(dod),
+        "DOB": clean_value(dob),
+        "DOD": clean_value(dod),
 }
 
 # ---------------- Helper: parent map ----------------
