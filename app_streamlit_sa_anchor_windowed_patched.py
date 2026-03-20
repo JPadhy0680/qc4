@@ -588,13 +588,14 @@ for inb2 in obs.findall('.//hl7:inboundRelationship/hl7:observation', NS):
                 "LLT Code": clean_value(llt_code),
                 "LLT Term": clean_value(llt_term),
                 "Status": ", ".join(statuses) if statuses else "",
-                    \"Status (Continue)\": clean_value(mh_continue),
-    \"Comment\": clean_value(mh_comment),
-"Start Date (raw)": sd_raw,
+                "Status (Continue)": clean_value(mh_continue),
+                "Comment": clean_value(mh_comment),
+                "Start Date (raw)": sd_raw,
                 "Start Date": sd,
                 "End Date (raw)": ed_raw,
                 "End Date": ed,
                 "_key": key,
+
             })
     return items
 
