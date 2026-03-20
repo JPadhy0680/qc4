@@ -719,17 +719,17 @@ def extract_causality(
     out: List[Dict[str, Any]] = []
     try:
     # --- De-dup trackers
-    processed_nodes: Set[int] = set()  # prevent same CA node via nested components
-    seen_signatures: Set[Tuple[str, str, str, str, str, str]] = set()  # content-level de-dup
+        processed_nodes: Set[int] = set()  # prevent same CA node via nested components
+        seen_signatures: Set[Tuple[str, str, str, str, str, str]] = set()  # content-level de-dup
 
-    for comp in _iter_components_in_doc_order(root):
-        current_intervention = ""  # resets per component
-        ca_nodes = comp.findall('.//hl7:causalityAssessment', NS)
-        for node in ca_nodes:
+        for comp in _iter_components_in_doc_order(root):
+            current_intervention = ""  # resets per component
+            ca_nodes = comp.findall('.//hl7:causalityAssessment', NS)
+            for node in ca_nodes:
             # Node-level de-duplication
-            if id(node) in processed_nodes:
-                continue
-            processed_nodes.add(id(node))
+                if id(node) in processed_nodes:
+                    continue
+                processed_nodes.add(id(node))
             
 # Node-level de-duplication
 if id(node) in processed_nodes:
