@@ -698,7 +698,7 @@ def extract_causality(
             ca_nodes = comp.findall('.//hl7:causalityAssessment', NS)
             for node in ca_nodes:
     # Node-level de-duplication
-        if id(node) in processed_nodes:
+            if id(node) in processed_nodes:
             continue
         processed_nodes.add(id(node))
                 ccode = node.find('hl7:code', NS)
