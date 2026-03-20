@@ -482,8 +482,8 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
         "Weight": clean_value(weight),
         "Initials": clean_value(initials),
         "Patient Record Number": clean_value(patient_record_no),
-        \"DOB\": clean_value(dob),
-    \"DOD\": clean_value(dod),
+        "DOB": clean_value(dob),
+        "DOD": clean_value(dod)
 }
 
 # ---------------- Helper: parent map ----------------
