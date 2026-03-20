@@ -473,16 +473,16 @@ if dod_el is not None:
 dod = format_date(dod_raw)
 
 
-    return {
-        "Gender": clean_value(gender),
-        "Age": clean_value(age),
-        "Age Group": clean_value(age_group),
-        "Height": clean_value(height),
-        "Weight": clean_value(weight),
-        "Initials": clean_value(initials),
-        "Patient Record Number": clean_value(patient_record_no),
-        "DOB": clean_value(dob),
-        "DOD": clean_value(dod),
+return {
+    "Gender": clean_value(gender),
+    "Age": clean_value(age),
+    "Age Group": clean_value(age_group),
+    "Height": clean_value(height),
+    "Weight": clean_value(weight),
+    "Initials": clean_value(initials),
+    "Patient Record Number": clean_value(patient_record_no),
+    "DOB": clean_value(dob),
+    "DOD": clean_value(dod),
 }
 
 # ---------------- Helper: parent map ----------------
