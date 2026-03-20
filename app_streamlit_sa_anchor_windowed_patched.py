@@ -990,10 +990,8 @@ def extract_drug_history(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
                 continue
             items.append({
                 'Drug': drug,
-                'Indication': "
-".join(indications),
-                'Reaction': "
-".join(reactions),
+                'Indication': "\n".join(indications),
+                'Reaction': "\n".join(reactions),
                 'Start Date (raw)': sd_raw,
                 'Start Date': sd,
                 'End Date (raw)': ed_raw,
