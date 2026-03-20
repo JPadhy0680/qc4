@@ -729,7 +729,7 @@ def extract_causality(
     reaction_id_to_term: Optional[Dict[str, str]] = None
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    try:
+    try
     # --- De-dup trackers
         processed_nodes: Set[int] = set()
         seen_signatures: Set[Tuple[str, str, str, str, str, str]] = set()
