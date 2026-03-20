@@ -731,24 +731,24 @@ def extract_causality(
     out: List[Dict[str, Any]] = []
     try:
     # --- De-dup trackers
-    processed_nodes: Set[int] = set()
-    seen_signatures: Set[Tuple[str, str, str, str, str, str]] = set()
-        for comp in _iter_components_in_doc_order(root):
-            current_intervention = ""  # resets per component
-            ca_nodes = comp.findall('.//hl7:causalityAssessment', NS)
-            for node in ca_nodes:
+        processed_nodes: Set[int] = set()
+        seen_signatures: Set[Tuple[str, str, str, str, str, str]] = set()
+            for comp in _iter_components_in_doc_order(root):
+                current_intervention = ""  # resets per component
+                ca_nodes = comp.findall('.//hl7:causalityAssessment', NS)
+                for node in ca_nodes:
             # Node-level de-duplication
-            if id(node) in processed_nodes:
-                continue
-            processed_nodes.add(id(node))
-                ccode = node.find('hl7:code', NS)
-                if ccode is None:
+                if id(node) in processed_nodes:
                     continue
-                cs = (ccode.attrib.get('codeSystem') or '').strip()
-                cd = (ccode.attrib.get('code') or '').strip()
-                dsn = (ccode.attrib.get('displayName') or '').strip().lower()
-                if cs != STATUS_OID:
-                    continue
+                processed_nodes.add(id(node))
+                    ccode = node.find('hl7:code', NS)
+                    if ccode is None:
+                        continue
+                    cs = (ccode.attrib.get('codeSystem') or '').strip()
+                    cd = (ccode.attrib.get('code') or '').strip()
+                    dsn = (ccode.attrib.get('displayName') or '').strip().lower()
+                    if cs != STATUS_OID:
+                        continue
 
                 # Intervention sentinel (tracked but not displayed)
                 if dsn == 'interventioncharacterization' or cd == INTERVENTION_CHAR_CODE:
