@@ -164,6 +164,17 @@ def has_value(x: str) -> bool:
 def safe_disp(v: str) -> str:
     return v if v else "—"
 
+# 🔒 NEW: Convert any data to readable text for display tables
+def _textify(x: Any) -> str:
+    """Convert any value (list/dict/number/None) to a readable string for display."""
+    if x is None:
+        return ""
+    if isinstance(x, (list, tuple, set)):
+        return "; ".join(str(i) for i in x if i is not None)
+    if isinstance(x, dict):
+        return "; ".join(f"{k}: {v}" for k, v in x.items())
+    return str(x)
+
 # ---------------- Dependency-free XLSX reader ----------------
 def _col_letters_to_index(col_letters: str) -> int:
     res = 0
@@ -600,7 +611,7 @@ def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dic
                         if lbl and lbl not in statuses:
                             statuses.append(lbl)
 
-            # ---- Continue + Comment extraction (from STATUS_OID)
+            # Continue + Comment (STATUS_OID)
             mh_continue = ""
             mh_comment = ""
             for inb2 in obs.findall('.//hl7:inboundRelationship/hl7:observation', NS):
@@ -611,11 +622,9 @@ def extract_medical_history(root: ET.Element, meddra_map: Optional[Dict[str, Dic
                 cs2 = (sc2.attrib.get('codeSystem') or '').strip()
                 cd2 = (sc2.attrib.get('code') or '').strip()
                 dn2 = (sc2.attrib.get('displayName') or '').strip().lower()
-                # comment -> code '10' or displayName 'comment'
                 if cs2 == STATUS_OID and (cd2 == '10' or dn2 == 'comment'):
                     if val2 is not None:
                         mh_comment = (val2.text or val2.attrib.get('value') or '').strip()
-                # continuing -> code '13' or displayName 'continuing'
                 if cs2 == STATUS_OID and (cd2 == '13' or dn2 == 'continuing'):
                     if val2 is not None:
                         raw = (val2.attrib.get('value') or '').strip().lower()
@@ -790,7 +799,7 @@ def extract_causality(
                 if cs != STATUS_OID:
                     continue
 
-                # Intervention sentinel (tracked but not displayed)
+                # Intervention sentinel
                 if dsn == 'interventioncharacterization' or cd == INTERVENTION_CHAR_CODE:
                     current_intervention = _resolve_intervention_label(find_first(node, './/hl7:value'))
                     continue
@@ -942,7 +951,6 @@ def build_product_type_by_pid(root: ET.Element) -> Dict[str, str]:
             continue
         label = PRODUCT_TYPE_MAP.get(vcode, '')
         if label:
-            # last one wins if duplicates; typically they should be consistent
             result[pid] = label
     return result
 
@@ -979,8 +987,7 @@ def _resolve_drug_name(admin: ET.Element) -> str:
 def extract_drug_history(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, Any]]:
     """
     Collect prior/concomitant drug history items from the clinical section that is
-    tagged as 'drugHistory'. Some partners tag this section only via displayName
-    (without MH_SECTION_OID). This function anchors on either:
+    tagged as 'drugHistory'. Anchors on either:
       • codeSystem == MH_SECTION_OID AND code == '2'
       • displayName.lower() == 'drughistory'   (regardless of codeSystem)
     """
@@ -1634,8 +1641,7 @@ def extract_model(xml_bytes: bytes, meddra_map: Optional[Dict[str, Dict[str, str
     model["Patient"] = extract_patient(root)
     model["MedicalHistory"] = extract_medical_history(root, meddra_map=meddra_map)
     model["LabDetails"] = extract_labs(root, meddra_map=meddra_map)
-    # ✅ Ensure Drug History is populated in the model
-    model["DrugHistory"] = extract_drug_history(root, meddra_map=meddra_map)
+    model["DrugHistory"] = extract_drug_history(root, meddra_map=meddra_map)  # ✅ ensure present
 
     products = extract_all_products(root, meddra_map=meddra_map)  # pass map for Indication rule
     model["Products"] = products
@@ -1656,14 +1662,16 @@ def extract_model(xml_bytes: bytes, meddra_map: Optional[Dict[str, Dict[str, str
     return model
 
 # --------------- Table builders ----------------
-def compare_table(rows: List[Tuple[str, str, str]], treat_as_dates: bool = False) -> pd.DataFrame:
+# 🔒 UPDATED: robust compare_table that textifies values first
+def compare_table(rows: List[Tuple[str, Any, Any]], treat_as_dates: bool = False) -> pd.DataFrame:
     disp: List[Dict[str, str]] = []
     for field, s, p in rows:
-        s_str, p_str = (s or '').strip(), (p or '').strip()
-        if not s_str and not p_str:
+        s_txt = _textify(s).strip()
+        p_txt = _textify(p).strip()
+        if not s_txt and not p_txt:
             continue
-        marker = mismatch_marker(s, p, is_date=treat_as_dates)
-        disp.append({"Field": field, "Source": safe_disp(s_str), "Processed": safe_disp(p_str) + marker})
+        marker = mismatch_marker(s_txt, p_txt, is_date=treat_as_dates)
+        disp.append({"Field": field, "Source": safe_disp(s_txt), "Processed": safe_disp(p_txt) + marker})
     return pd.DataFrame(disp) if disp else pd.DataFrame(columns=["Field", "Source", "Processed"])
 
 
@@ -1782,11 +1790,15 @@ else:
         srep = src_reps[i] if i < len(src_reps) else {}
         prep = prc_reps[i] if i < len(prc_reps) else {}
         st.markdown(f'<h6 style="margin-top:0.5rem;margin-bottom:0.25rem;">Reporter {i+1}</h6><hr/>', unsafe_allow_html=True)
-        r_df = make_reporter_pair_table(srep, prep)
-        if not r_df.empty:
-            st.table(r_df)
-        else:
-            st.markdown('<div style="color:#888">No values for this reporter.</div>', unsafe_allow_html=True)
+        # 🔒 guard the reporter box
+        try:
+            r_df = make_reporter_pair_table(srep, prep)
+            if not r_df.empty:
+                st.table(r_df)
+            else:
+                st.markdown('<div style="color:#888">No values for this reporter.</div>', unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"Reporter {i+1} render error: {e}")
         st.markdown('<div style="height:0.5rem;"></div>', unsafe_allow_html=True)
 
 # 3) Patient
