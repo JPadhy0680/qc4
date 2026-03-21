@@ -164,7 +164,7 @@ def has_value(x: str) -> bool:
 def safe_disp(v: str) -> str:
     return v if v else "—"
 
-# 🔒 NEW: Convert any data to readable text for display tables
+# 🔒 Convert any data to readable text for display tables
 def _textify(x: Any) -> str:
     """Convert any value (list/dict/number/None) to a readable string for display."""
     if x is None:
@@ -1075,6 +1075,67 @@ def extract_drug_history(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
 
     return items
 
+# ---------------- Death Details extraction (by displayName) ----------------
+def extract_death_details(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str, str]]] = None) -> Dict[str, str]:
+    """
+    Fetch death-related details by displayName:
+      • reportedCauseOfDeath : hl7:observation/hl7:code@displayName="reportedCauseOfDeath"
+            -> value may be CE with codeSystem MedDRA (LLT) and/or originalText
+      • autopsy             : hl7:observation/hl7:code@displayName="autopsy"
+            -> value is BL true/false -> 'Yes'/'No'
+    """
+    out = {
+        "Reported Cause of Death": "",
+        "Autopsy": ""
+    }
+
+    # reportedCauseOfDeath
+    for obs in root.findall('.//hl7:observation', NS):
+        c = obs.find('hl7:code', NS)
+        if c is None:
+            continue
+        if (c.attrib.get('displayName') or '').strip() != 'reportedCauseOfDeath':
+            continue
+        val = obs.find('hl7:value', NS)
+        cause_term = ""
+        if val is not None:
+            llt_code = (val.attrib.get('code') or '').strip()
+            if meddra_map and llt_code and llt_code in meddra_map:
+                cause_term = (meddra_map[llt_code].get('LLT Term') or '').strip()
+            if not cause_term:
+                cause_term = (val.attrib.get('displayName') or '').strip()
+            if not cause_term:
+                ot = val.find('hl7:originalText', NS)
+                if ot is not None and (ot.text or '').strip():
+                    cause_term = ot.text.strip()
+            if not cause_term and llt_code:
+                cause_term = llt_code
+        out["Reported Cause of Death"] = clean_value(cause_term)
+        if out["Reported Cause of Death"]:
+            break  # first one wins
+
+    # autopsy
+    for obs in root.findall('.//hl7:observation', NS):
+        c = obs.find('hl7:code', NS)
+        if c is None:
+            continue
+        if (c.attrib.get('displayName') or '').strip() != 'autopsy':
+            continue
+        val = obs.find('hl7:value', NS)
+        if val is None:
+            continue
+        raw = (val.attrib.get('value') or val.text or '').strip().lower()
+        if raw in {'true', '1', 'yes', 'y'}:
+            out["Autopsy"] = "Yes"
+        elif raw in {'false', '0', 'no', 'n'}:
+            out["Autopsy"] = "No"
+        else:
+            out["Autopsy"] = (val.attrib.get('value') or val.text or '').strip()
+        break
+
+    # Trim if completely empty
+    return {k: v for k, v in out.items() if v} if any(out.values()) else {}
+
 # ---------------- Iter helpers and product aggregation ----------------
 def _iter_drug_components(root: ET.Element) -> List[ET.Element]:
     comps: List[ET.Element] = []
@@ -1641,7 +1702,9 @@ def extract_model(xml_bytes: bytes, meddra_map: Optional[Dict[str, Dict[str, str
     model["Patient"] = extract_patient(root)
     model["MedicalHistory"] = extract_medical_history(root, meddra_map=meddra_map)
     model["LabDetails"] = extract_labs(root, meddra_map=meddra_map)
-    model["DrugHistory"] = extract_drug_history(root, meddra_map=meddra_map)  # ✅ ensure present
+    model["DrugHistory"] = extract_drug_history(root, meddra_map=meddra_map)
+    # ✅ Death details (for display inside Medical History section)
+    model["DeathDetails"] = extract_death_details(root, meddra_map=meddra_map)
 
     products = extract_all_products(root, meddra_map=meddra_map)  # pass map for Indication rule
     model["Products"] = products
@@ -1692,6 +1755,31 @@ def make_admin_table(src: Dict[str, Any], prc: Dict[str, Any]) -> pd.DataFrame:
     ]
     parts = [df for df in parts if not df.empty]
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["Field", "Source", "Processed"])
+
+
+# ✅ Reporter table builder (fixes NameError)
+def make_reporter_pair_table(src_rep: Dict[str, Any], prc_rep: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Side-by-side comparison for a single reporter.
+    """
+    fields_in_order = [
+        "Reporter IDs",
+        "Reporter Qualification",
+        "Reporter Title",
+        "Reporter Given Name(s)",
+        "Reporter Family Name",
+        "Reporter Organization",
+        "Reporter Street",
+        "Reporter City/Town",
+        "Reporter State/Province",
+        "Reporter Postal Code",
+        "Reporter Country",
+        "Reporter Phone(s)",
+        "Reporter Email(s)",
+        "Reporter Fax(es)",
+    ]
+    rows = [(label, src_rep.get(label, ""), prc_rep.get(label, "")) for label in fields_in_order]
+    return compare_table(rows, treat_as_dates=False)
 
 
 # ✅ Patient table in requested order
@@ -1790,7 +1878,6 @@ else:
         srep = src_reps[i] if i < len(src_reps) else {}
         prep = prc_reps[i] if i < len(prc_reps) else {}
         st.markdown(f'<h6 style="margin-top:0.5rem;margin-bottom:0.25rem;">Reporter {i+1}</h6><hr/>', unsafe_allow_html=True)
-        # 🔒 guard the reporter box
         try:
             r_df = make_reporter_pair_table(srep, prep)
             if not r_df.empty:
@@ -1809,63 +1896,7 @@ if not pat_df.empty:
 else:
     st.markdown('<div style="color:#888">No patient values present.</div>', unsafe_allow_html=True)
 
-# Medical History
-st.subheader("Medical History")
-src_mh = src.get("MedicalHistory", []) or []
-prc_mh = prc.get("MedicalHistory", []) or []
-
-def _idx_mh(lst: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    return {e.get("_key", ""): e for e in lst if e.get("_key", "")}
-
-src_mh_idx = _idx_mh(src_mh)
-prc_mh_idx = _idx_mh(prc_mh)
-all_mh_keys = sorted(set(src_mh_idx) | set(prc_mh_idx))
-
-def make_mh_box_for_ui(src_rec: Dict[str, Any], prc_rec: Dict[str, Any], title: str):
-    st.markdown(f'<h6 style="margin-top:0.5rem;margin-bottom:0.25rem;">Medical History: {title}</h6><hr/>', unsafe_allow_html=True)
-    # Only LLT is relevant for term display; PT fields removed from UI
-    llc = src_rec.get("LLT Code", "") or ""
-    llt = src_rec.get("LLT Term", "") or ""
-    plc = prc_rec.get("LLT Code", "") or ""
-    plt = prc_rec.get("LLT Term", "") or ""
-    # If term exists (mapping), blank out code; else keep code and blank term
-    if llt:
-        llc = ""
-    if plt:
-        plc = ""
-    pairs = [
-        ("LLT", (llt or llc), (plt or plc)),
-        ("Status", src_rec.get("Status", ""), prc_rec.get("Status", "")),
-        ("Status (Continue)", src_rec.get("Status (Continue)", ""), prc_rec.get("Status (Continue)", "")),
-        ("Comment", src_rec.get("Comment", ""), prc_rec.get("Comment", "")),
-        (
-            "Start Date",
-            src_rec.get("Start Date", "") or format_date(src_rec.get("Start Date (raw)", "")),
-            prc_rec.get("Start Date", "") or format_date(prc_rec.get("Start Date (raw)", "")),
-        ),
-        (
-            "End Date",
-            src_rec.get("End Date", "") or format_date(src_rec.get("End Date (raw)", "")),
-            prc_rec.get("End Date", "") or format_date(prc_rec.get("End Date (raw)", "")),
-        ),
-    ]
-    mh_df = compare_table(pairs, treat_as_dates=True)
-    if not mh_df.empty:
-        st.table(mh_df)
-    else:
-        st.markdown('<div style="color:#888">No values for this item.</div>', unsafe_allow_html=True)
-    st.markdown('<div style="height:0.5rem;"></div>', unsafe_allow_html=True)
-
-if not all_mh_keys:
-    st.markdown('<div style="color:#888">No medical history found.</div>', unsafe_allow_html=True)
-else:
-    for key in all_mh_keys:
-        se = src_mh_idx.get(key, {})
-        pe = prc_mh_idx.get(key, {})
-        title = se.get("LLT Term") or pe.get("LLT Term") or (se.get("LLT Code") or pe.get("LLT Code") or "(Unnamed history)")
-        make_mh_box_for_ui(se, pe, title)
-
-# Drug History
+# 4) Drug History
 st.subheader("Drug History")
 src_dh = src.get("DrugHistory", []) or []
 prc_dh = prc.get("DrugHistory", []) or []
@@ -1910,7 +1941,82 @@ else:
         title = (se.get("Drug") or pe.get("Drug") or "(Unnamed drug)")
         make_drughist_box_for_ui(se, pe, title)
 
-# 4) Drug
+# 5) Medical History (moved to appear AFTER Drug History)
+st.subheader("Medical History")
+
+# ✅ Death Details mini-box at top of this section
+src_dd = src.get("DeathDetails", {}) or {}
+prc_dd = prc.get("DeathDetails", {}) or {}
+
+def make_death_details_table(src_dd: Dict[str, Any], prc_dd: Dict[str, Any]) -> pd.DataFrame:
+    rows = [
+        ("Reported Cause of Death", src_dd.get("Reported Cause of Death", ""), prc_dd.get("Reported Cause of Death", "")),
+        ("Autopsy", src_dd.get("Autopsy", ""), prc_dd.get("Autopsy", "")),
+    ]
+    # Hide fully empty rows
+    rows = [r for r in rows if (str(r[1]).strip() or str(r[2]).strip())]
+    return compare_table(rows, treat_as_dates=False)
+
+dd_df = make_death_details_table(src_dd, prc_dd)
+if not dd_df.empty:
+    st.markdown('<h6 style="margin-top:0.5rem;margin-bottom:0.25rem;">Death Details</h6><hr/>', unsafe_allow_html=True)
+    st.table(dd_df)
+    st.markdown('<div style="height:0.5rem;"></div>', unsafe_allow_html=True)
+
+# ---- Existing Medical History items
+src_mh = src.get("MedicalHistory", []) or []
+prc_mh = prc.get("MedicalHistory", []) or []
+
+def _idx_mh(lst: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {e.get("_key", ""): e for e in lst if e.get("_key", "")}
+
+src_mh_idx = _idx_mh(src_mh)
+prc_mh_idx = _idx_mh(prc_mh)
+all_mh_keys = sorted(set(src_mh_idx) | set(prc_mh_idx))
+
+def make_mh_box_for_ui(src_rec: Dict[str, Any], prc_rec: Dict[str, Any], title: str):
+    st.markdown(f'<h6 style="margin-top:0.5rem;margin-bottom:0.25rem;">Medical History: {title}</h6><hr/>', unsafe_allow_html=True)
+    llc = src_rec.get("LLT Code", "") or ""
+    llt = src_rec.get("LLT Term", "") or ""
+    plc = prc_rec.get("LLT Code", "") or ""
+    plt = prc_rec.get("LLT Term", "") or ""
+    if llt:
+        llc = ""
+    if plt:
+        plc = ""
+    pairs = [
+        ("LLT", (llt or llc), (plt or plc)),
+        ("Status", src_rec.get("Status", ""), prc_rec.get("Status", "")),
+        ("Status (Continue)", src_rec.get("Status (Continue)", ""), prc_rec.get("Status (Continue)", "")),
+        ("Comment", src_rec.get("Comment", ""), prc_rec.get("Comment", "")),
+        (
+            "Start Date",
+            src_rec.get("Start Date", "") or format_date(src_rec.get("Start Date (raw)", "")),
+            prc_rec.get("Start Date", "") or format_date(prc_rec.get("Start Date (raw)", "")),
+        ),
+        (
+            "End Date",
+            src_rec.get("End Date", "") or format_date(src_rec.get("End Date (raw)", "")),
+            prc_rec.get("End Date", "") or format_date(prc_rec.get("End Date (raw)", "")),
+        ),
+    ]
+    mh_df = compare_table(pairs, treat_as_dates=True)
+    if not mh_df.empty:
+        st.table(mh_df)
+    else:
+        st.markdown('<div style="color:#888">No values for this item.</div>', unsafe_allow_html=True)
+    st.markdown('<div style="height:0.5rem;"></div>', unsafe_allow_html=True)
+
+if not all_mh_keys and dd_df.empty:
+    st.markdown('<div style="color:#888">No medical history found.</div>', unsafe_allow_html=True)
+else:
+    for key in all_mh_keys:
+        se = src_mh_idx.get(key, {})
+        pe = prc_mh_idx.get(key, {})
+        title = se.get("LLT Term") or pe.get("LLT Term") or (se.get("LLT Code") or pe.get("LLT Code") or "(Unnamed history)")
+        make_mh_box_for_ui(se, pe, title)
+
+# 6) Drug
 st.subheader("Drug")
 src_prods = src.get("Products", [])
 prc_prods = prc.get("Products", [])
@@ -1952,7 +2058,7 @@ else:
             st.markdown('<div style="color:#888">No values to display for this drug.</div>', unsafe_allow_html=True)
         st.markdown('<div style="height:0.5rem;"></div>', unsafe_allow_html=True)
 
-# 5) Event
+# 7) Event
 st.subheader("Event")
 src_evts = src.get("Events", []) or []
 prc_evts = prc.get("Events", []) or []
@@ -2001,7 +2107,7 @@ else:
         title = se.get("Event Term") or pe.get("Event Term") or se.get("RRT") or pe.get("RRT") or "(Unnamed event)"
         make_event_box_for_ui(se, pe, title)
 
-# 6) Lab
+# 8) Lab
 st.subheader("Lab")
 src_lab = src.get("LabDetails", []) or []
 prc_lab = prc.get("LabDetails", []) or []
@@ -2047,7 +2153,7 @@ else:
         title = (se.get("LLT Term") or pe.get("LLT Term") or se.get("LLT Code") or pe.get("LLT Code") or "(Unnamed lab)")
         make_lab_box_for_ui(se, pe, title)
 
-# 7) Narrative
+# 9) Narrative
 st.subheader("Narrative")
 src_narr_full = src.get("Narrative", "") or ""
 prc_narr_full = prc.get("Narrative", "") or ""
@@ -2061,7 +2167,7 @@ else:
     st.markdown(f'<div style="white-space:pre-wrap">{prc_narr_full if prc_narr_full else "—"}</div>', unsafe_allow_html=True)
     st.markdown('<div style="height:0.5rem;"></div>', unsafe_allow_html=True)
 
-# 8) Causality — SINGLE CONSOLIDATED TABLE
+# 10) Causality — SINGLE CONSOLIDATED TABLE
 st.subheader("Causality")
 
 def _caus_df(lst: List[Dict[str, Any]]) -> pd.DataFrame:
