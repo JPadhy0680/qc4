@@ -55,28 +55,6 @@ STATUS_OID = "2.16.840.1.113883.3.989.2.1.1.19"      # status & flags (causality
 INTERVENTION_CHAR_CODE = "20"
 CAUSALITY_CODE = "39"
 
-# ✅ Authorization identifiers (Marketing Authorization)
-AUTH_NO_OID = "2.16.840.1.113883.3.989.2.1.3.4"      # <id root="..."> extension = Authorization No
-AUTH_COUNTRY_CS = "1.0.3166.1.2.2"                    # territorialAuthority/territory/code@codeSystem
-
-# ✅ Drug provision (supply type) OID
-DRUG_PROVISION_OID = "2.16.840.1.113883.3.989.2.1.1.18"
-
-# ✅ Coded Drug Information mapping (STATUS_OID, code '9')
-CODED_DRUG_INFO_MAP = {
-    "1":  "Counterfeit",
-    "2":  "Overdose",
-    "3":  "Drug taken by the father",
-    "4":  "Drug taken beyond expiry date",
-    "5":  "Batch and lot tested and found within specifications",
-    "6":  "Batch and lot tested and found not within specifications",
-    "7":  "Medication error",
-    "8":  "Misuse",
-    "9":  "Abuse",
-    "10": "Occupational exposure",
-    "11": "Off label use",
-}
-
 # TD priority paths (for Day Zero: Source=TD, Processed=LRD)
 TD_PATHS = [
     './/hl7:transmissionWrapper/hl7:creationTime',
@@ -436,7 +414,6 @@ def find_mask_aware_id_by_root(root: ET.Element, oid: str) -> str:
             ext = (el.attrib.get('extension') or '').strip()
             return ext
     return ""
-
 
 def extract_patient(root: ET.Element) -> Dict[str, str]:
     # Gender
@@ -803,7 +780,7 @@ def extract_causality(
         seen_signatures: Set[Tuple[str, str, str, str, str, str]] = set()
 
         for comp in _iter_components_in_doc_order(root):
-            current_intervention = ""
+            current_intervention = ""  # resets per component
             ca_nodes = comp.findall('.//hl7:causalityAssessment', NS)
             for node in ca_nodes:
                 if id(node) in processed_nodes:
@@ -819,13 +796,16 @@ def extract_causality(
                 if cs != STATUS_OID:
                     continue
 
+                # Intervention sentinel
                 if dsn == 'interventioncharacterization' or cd == INTERVENTION_CHAR_CODE:
                     current_intervention = _resolve_intervention_label(find_first(node, './/hl7:value'))
                     continue
 
+                # Causality rows
                 if not (cd == CAUSALITY_CODE or dsn == 'causality'):
                     continue
 
+                # Assessment (xsi:ST text or @value)
                 val = find_first(node, './/hl7:value')
                 assessment = ""
                 if val is not None:
@@ -835,6 +815,7 @@ def extract_causality(
                 method = get_text(find_first(node, './/hl7:methodCode/hl7:originalText'))
                 assessor = _extract_assessor_label(node)
 
+                # IDs -> names
                 evt_id = ""
                 prd_id = ""
                 evt = find_first(node, './/hl7:subject1//hl7:adverseEffectReference//hl7:id')
@@ -853,10 +834,12 @@ def extract_causality(
                         if nm_txt:
                             drug_name = nm_txt
 
+                # Pairing key (internal only)
                 key = (evt_id or "") + "::" + (prd_id or "")
                 if not key.strip(":"):
                     key = "assess::" + normalize_text(assessment or "") + "::" + normalize_text(method or "")
 
+                # Content-level de-duplication
                 row_sig = (
                     (evt_id or "").strip().lower(),
                     (prd_id or "").strip().lower(),
@@ -926,8 +909,14 @@ PRODUCT_TYPE_MAP: Dict[str, str] = {
     "4": "Drug Not Administered",
 }
 
-
 def build_product_type_by_pid(root: ET.Element) -> Dict[str, str]:
+    """
+    Build a map of product-id-root -> product type label based on:
+    <causalityAssessment>
+      <code code="20" codeSystem=STATUS_OID ... displayName="interventionCharacterization"/>
+      <value code="1|2|3|4" .../>
+      <subject2><productUseReference><id root="..."/></subject2>
+    """
     result: Dict[str, str] = {}
     for node in findall(root, './/hl7:causalityAssessment'):
         ccode = node.find('hl7:code', NS)
@@ -982,10 +971,19 @@ def _resolve_drug_name(admin: ET.Element) -> str:
         return amp.text.strip()
     return ""
 
-# ---------------- Drug History extraction (RELAXED: accept displayName="drugHistory") ----------------
+# ---------------- Drug History extraction (RELAXED + robust dates) ----------------
 def extract_drug_history(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, Any]]:
+    """
+    Collect prior/concomitant drug history items from the clinical section that is
+    tagged as 'drugHistory'. Anchors on either:
+      • codeSystem == MH_SECTION_OID AND code == '2'
+      • displayName.lower() == 'drughistory'   (regardless of codeSystem)
+    Uses robust date extraction (supports SXPR/IVL and mask).
+    """
     items: List[Dict[str, Any]] = []
     pmap = build_parent_map(root)
+
+    # ---- Find anchors by either codeSystem/code or by displayName='drugHistory'
     anchors: List[ET.Element] = []
     for code in root.findall('.//hl7:code', NS):
         disp = (code.attrib.get('displayName') or '').strip().lower()
@@ -1012,13 +1010,10 @@ def extract_drug_history(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
         for sa in container.findall('.//hl7:substanceAdministration[@moodCode="EVN"][@classCode="SBADM"]', NS):
             drug = clean_value(_resolve_drug_name(sa))
 
-            low  = find_first(sa, './/hl7:effectiveTime/hl7:low')
-            high = find_first(sa, './/hl7:effectiveTime/hl7:high')
-            sd_raw = (low.attrib.get('value')  or '').strip() if (low  is not None and low.attrib.get('value'))  else ''
-            ed_raw = (high.attrib.get('value') or '').strip() if (high is not None and high.attrib.get('value')) else ''
-            sd = 'Masked' if (low  is not None and (low.attrib.get('nullFlavor')  or '').upper() == 'MSK') else format_date(sd_raw)
-            ed = 'Masked' if (high is not None and (high.attrib.get('nullFlavor') or '').upper() == 'MSK') else format_date(ed_raw)
+            # Dates (robust)
+            sd, ed = _extract_sa_dates(sa)
 
+            # Indications / Reactions attached to this SA via STATUS_OID
             indications: List[str] = []
             reactions:  List[str] = []
 
@@ -1045,7 +1040,7 @@ def extract_drug_history(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
                     if has_value(term) and term not in reactions:
                         reactions.append(term)
 
-            key = (normalize_text(drug) or f"sa::{sd_raw}::{ed_raw}")
+            key = (normalize_text(drug) or f"sa::{sd}::{ed}")
             if not key:
                 continue
 
@@ -1053,9 +1048,7 @@ def extract_drug_history(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
                 'Drug': drug,
                 'Indication': "\n".join(indications),
                 'Reaction':  "\n".join(reactions),
-                'Start Date (raw)': sd_raw,
                 'Start Date': sd,
-                'End Date (raw)': ed_raw,
                 'End Date': ed,
                 '_key': key,
             })
@@ -1064,17 +1057,17 @@ def extract_drug_history(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
 
 # ---------------- Death Details extraction (by displayName) ----------------
 def extract_death_details(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str, str]]] = None) -> Dict[str, str]:
-    out = {
-        "Reported Cause of Death": "",
-        "Autopsy": ""
-    }
+    """
+    Fetch death-related details by displayName:
+      • reportedCauseOfDeath : value may be CE with MedDRA LLT and/or originalText
+      • autopsy             : BL true/false -> 'Yes'/'No'
+    """
+    out = {"Reported Cause of Death": "", "Autopsy": ""}
 
     # reportedCauseOfDeath
     for obs in root.findall('.//hl7:observation', NS):
         c = obs.find('hl7:code', NS)
-        if c is None:
-            continue
-        if (c.attrib.get('displayName') or '').strip() != 'reportedCauseOfDeath':
+        if c is None or (c.attrib.get('displayName') or '').strip() != 'reportedCauseOfDeath':
             continue
         val = obs.find('hl7:value', NS)
         cause_term = ""
@@ -1097,9 +1090,7 @@ def extract_death_details(root: ET.Element, meddra_map: Optional[Dict[str, Dict[
     # autopsy
     for obs in root.findall('.//hl7:observation', NS):
         c = obs.find('hl7:code', NS)
-        if c is None:
-            continue
-        if (c.attrib.get('displayName') or '').strip() != 'autopsy':
+        if c is None or (c.attrib.get('displayName') or '').strip() != 'autopsy':
             continue
         val = obs.find('hl7:value', NS)
         if val is None:
@@ -1124,7 +1115,6 @@ def _iter_drug_components(root: ET.Element) -> List[ET.Element]:
             comps.append(comp)
     return comps
 
-
 def _add_unique(acc_list: List[str], value: str):
     v = clean_value(value)
     if not v:
@@ -1132,23 +1122,74 @@ def _add_unique(acc_list: List[str], value: str):
     if v not in acc_list:
         acc_list.append(v)
 
+# ✅ Robust SA date extractor (handles SXPR/IVL and mask)
+def _extract_sa_dates(sa: ET.Element) -> Tuple[str, str]:
+    """
+    Extract (Start, Stop) for a substanceAdministration with robust handling:
+      • <effectiveTime value="YYYYMMDD">
+      • <effectiveTime><low/><high/></effectiveTime>
+      • <effectiveTime>//comp//low|high (SXPR_TS / IVL_TS / PIVL_TS)
+      • nullFlavor="MSK" -> "Masked"
+    Returns display strings already formatted via format_date / "Masked".
+    """
+    et_nodes = sa.findall('.//hl7:effectiveTime', NS)
+
+    def _pick_first(nodes: List[ET.Element], tag: str) -> Tuple[str, bool]:
+        # direct child
+        for node in nodes:
+            child = node.find(f'hl7:{tag}', NS)
+            if child is not None:
+                nf = (child.attrib.get('nullFlavor') or '').strip().upper()
+                if nf == 'MSK':
+                    return ("Masked", True)
+                val = (child.attrib.get('value') or '').strip()
+                if val:
+                    return (val, False)
+        # any descendant (comp/IVL_TS/PIVL_TS)
+        for node in nodes:
+            for desc in node.findall(f'.//hl7:{tag}', NS):
+                nf = (desc.attrib.get('nullFlavor') or '').strip().upper()
+                if nf == 'MSK':
+                    return ("Masked", True)
+                val = (desc.attrib.get('value') or '').strip()
+                if val:
+                    return (val, False)
+        return ("", False)
+
+    low_val, low_mask = _pick_first(et_nodes, 'low')
+    high_val, high_mask = _pick_first(et_nodes, 'high')
+
+    # Instant @value as fallback
+    if not low_val:
+        for et in et_nodes:
+            v = (et.attrib.get('value') or '').strip()
+            if v:
+                low_val = v
+                break
+
+    start_disp = "Masked" if low_mask else format_date(low_val)
+    end_disp   = "Masked" if high_mask else format_date(high_val)
+    return (start_disp or "", end_disp or "")
 
 def extract_all_products(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str, str]]] = None) -> List[Dict[str, Any]]:
     """
     Anchor-windowed extraction. Create exactly ONE product row for each direct-child
     <substanceAdministration SBADM/EVN> that has a non-empty <id@root>.
 
-    For a given anchor SA, we aggregate content from the current SA position up to
+    For a given anchor SA, aggregate content from the current SA position up to
     (but not including) the next anchor SA within the SAME <component>.
+
+    Now includes nested SAs and robust date parsing (SXPR/IVL).
     """
     suspects = extract_suspect_ids(root)
     interact = extract_interacting_ids(root)
     treatments = extract_treatment_ids(root)
+
     product_type_by_pid = build_product_type_by_pid(root)
 
     out: List[Dict[str, Any]] = []
     comps = _iter_drug_components(root)
-    for comp in comps:
+    for cidx, comp in enumerate(comps, start=1):
         comp_children = list(comp)
 
         # Identify direct-child SAs at this component level
@@ -1168,7 +1209,6 @@ def extract_all_products(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
 
         if not anchors:
             continue
-
         anchors.sort(key=lambda t: t[0])
 
         for a_idx, (pos, sa_anchor, pid) in enumerate(anchors, start=1):
@@ -1182,10 +1222,10 @@ def extract_all_products(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
                     acc.extend(wn.findall(xpath, NS))
                 return acc
 
-            # ---- Resolve title from the ANCHOR SA only (stable name), fallback to pid
+            # Title from ANCHOR SA only
             title = clean_value(_resolve_drug_name(sa_anchor)) or pid
 
-            # ---- Type from causalityAssessment/interventionCharacterization if available
+            # Type from categorization map; else heuristic
             type_disp = product_type_by_pid.get(pid, "")
             if not type_disp:
                 tags: Set[str] = set()
@@ -1199,7 +1239,7 @@ def extract_all_products(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
                     tags.add('Concomitant')
                 type_disp = ', '.join(sorted(tags))
 
-            # ---- Aggregate SA-native + window-scoped fields
+            # Aggregate fields across ALL SAs within the window (including nested)
             dosage_texts: List[str] = []
             dose_vals: List[str] = []
             dose_units: List[str] = []
@@ -1210,24 +1250,13 @@ def extract_all_products(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
             lots: List[str] = []
             mahs: List[str] = []
 
-            # Extended fields
-            name_qualifiers: List[str] = []
-            active_ingredients: List[str] = []
-            supply_types: List[str] = []
-            frequencies: List[str] = []
-            cumulative_dose_rxn: List[str] = []
-            additional_info: List[str] = []
-            coded_drug_info: List[str] = []
-            auth_nos: List[str] = []
-            auth_countries: List[str] = []
-            auth_holders: List[str] = []
-
-            # consider every SA SBADM/EVN inside the window (including anchor)
             for wn in window_nodes:
-                if local_name(wn.tag) != 'substanceAdministration':
-                    sas = wn.findall('.//hl7:substanceAdministration[@moodCode="EVN"][@classCode="SBADM"]', NS)
+                # include self if SA, plus any nested SAs
+                if local_name(wn.tag) == 'substanceAdministration':
+                    sas = [wn] + wn.findall('.//hl7:substanceAdministration[@moodCode="EVN"][@classCode="SBADM"]', NS)
                 else:
-                    sas = [wn]
+                    sas = wn.findall('.//hl7:substanceAdministration[@moodCode="EVN"][@classCode="SBADM"]', NS)
+
                 for sa in sas:
                     # dosage text
                     txt = get_text(find_first(sa, './/hl7:text'))
@@ -1239,35 +1268,20 @@ def extract_all_products(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
                         _add_unique(dose_vals, (dq.attrib.get('value') or '').strip())
                         _add_unique(dose_units, (dq.attrib.get('unit') or '').strip())
 
-                    # dates
-                    low = find_first(sa, './/hl7:effectiveTime/hl7:low')
-                    high = find_first(sa, './/hl7:effectiveTime/hl7:high')
-                    sd = format_date((low.attrib.get('value') or '').strip() if low is not None else '')
-                    ed = format_date((high.attrib.get('value') or '').strip() if high is not None else '')
+                    # dates (robust)
+                    sd, ed = _extract_sa_dates(sa)
                     _add_unique(start_dates, sd)
                     _add_unique(stop_dates, ed)
 
-                    # frequency (PIVL_TS period)
-                    for per in sa.findall('.//hl7:effectiveTime//hl7:period', NS):
-                        pv = (per.attrib.get('value') or '').strip()
-                        pu = (per.attrib.get('unit') or '').strip()
-                        if pv or pu:
-                            _add_unique(frequencies, f"{pv} {pu}".strip())
-
-                    # route (prefer originalText, then displayName, then code)
+                    # route
                     rtxt = get_text(find_first(sa, './/hl7:routeCode/hl7:originalText'))
                     if not rtxt:
                         rc = find_first(sa, './/hl7:routeCode')
-                        if rc is not None:
-                            rtxt = (rc.attrib.get('displayName') or rc.attrib.get('code') or '').strip()
+                        rtxt = (rc.attrib.get('displayName') or '').strip() if rc is not None else ''
                     _add_unique(routes, rtxt)
 
-                    # form (prefer originalText; else fallback to displayName/code)
+                    # form
                     form = get_text(find_first(sa, './/hl7:formCode/hl7:originalText'))
-                    if not form:
-                        fc = find_first(sa, './/hl7:formCode')
-                        if fc is not None:
-                            form = (fc.attrib.get('displayName') or fc.attrib.get('code') or '').strip()
                     _add_unique(forms, form)
 
                     # lot
@@ -1275,6 +1289,7 @@ def extract_all_products(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
                     _add_unique(lots, lot)
 
                     # MAH
+                    mah = ''
                     for xp in [
                         './/hl7:playingOrganization/hl7:name',
                         './/hl7:manufacturerOrganization/hl7:name',
@@ -1282,77 +1297,11 @@ def extract_all_products(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
                     ]:
                         node = find_first(sa, xp)
                         if node is not None and get_text(node):
-                            _add_unique(mahs, get_text(node))
-                    # explicit authorization holder under approval/holder
-                    for hn in sa.findall('.//hl7:asManufacturedProduct//hl7:approval//hl7:holder//hl7:playingOrganization/hl7:name', NS):
-                        _add_unique(auth_holders, get_text(hn))
+                            mah = get_text(node)
+                            break
+                    _add_unique(mahs, mah)
 
-                    # name qualifiers
-                    for delm in sa.findall('.//hl7:kindOfProduct/hl7:name/hl7:delimiter', NS):
-                        qual = (delm.attrib.get('qualifier') or '').strip()
-                        dtx = (delm.text or '').strip()
-                        if dtx:
-                            _add_unique(name_qualifiers, f"{qual}: {dtx}" if qual else dtx)
-
-                    # active ingredients
-                    for ing in sa.findall('.//hl7:ingredient/hl7:ingredientSubstance/hl7:name', NS):
-                        _add_unique(active_ingredients, get_text(ing))
-
-                    # supply type (productEvent/code)
-                    for pe_code in sa.findall('.//hl7:productEvent/hl7:code', NS):
-                        cs = (pe_code.attrib.get('codeSystem') or '').strip()
-                        if cs == DRUG_PROVISION_OID:
-                            disp = (pe_code.attrib.get('displayName') or '').strip()
-                            cd = (pe_code.attrib.get('code') or '').strip()
-                            _add_unique(supply_types, disp or cd)
-
-                    # STATUS OID observations under outbound/inbound
-                    for ob in sa.findall('.//hl7:outboundRelationship2/hl7:observation', NS) + \
-                               sa.findall('.//hl7:inboundRelationship/hl7:observation', NS):
-                        c  = ob.find('hl7:code', NS)
-                        v  = ob.find('hl7:value', NS)
-                        if c is None:
-                            continue
-                        cs = (c.attrib.get('codeSystem') or '').strip()
-                        cd = (c.attrib.get('code') or '').strip()
-                        dn = (c.attrib.get('displayName') or '').strip().lower()
-                        if cs != STATUS_OID:
-                            continue
-
-                        # cumulativeDoseToReaction (code 14)
-                        if cd == '14' or dn == 'cumulativedosetoreaction':
-                            if v is not None:
-                                _add_unique(cumulative_dose_rxn, read_numeric_with_unit(v))
-
-                        # additionalInformation (code 2)
-                        if cd == '2' or dn == 'additionalinformation':
-                            txt = (v.text or '').strip() if (v is not None and v.text) else (v.attrib.get('value') or '').strip() if v is not None else ''
-                            _add_unique(additional_info, txt)
-
-                        # codedDrugInformation (code 9) — ✅ map to label
-                        if cd == '9' or dn == 'codeddruginformation':
-                            code_val = (v.attrib.get('code') or '').strip() if v is not None else ''
-                            disp_val = (v.attrib.get('displayName') or '').strip() if v is not None else ''
-                            mapped = CODED_DRUG_INFO_MAP.get(code_val, '')
-                            _add_unique(coded_drug_info, mapped or disp_val or code_val)
-
-            # ---- Additional window-scoped (outside SA)
-            # Authorization No
-            for id_el in win_findall(f'.//hl7:id[@root="{AUTH_NO_OID}"]'):
-                _add_unique(auth_nos, (id_el.attrib.get('extension') or '').strip())
-
-            # Authorization Country
-            for code_el in win_findall(f'.//hl7:territorialAuthority//hl7:territory//hl7:code[@codeSystem="{AUTH_COUNTRY_CS}"]'):
-                iso = (code_el.attrib.get('code') or '').strip()
-                name = (code_el.attrib.get('displayName') or '').strip()
-                if name and iso:
-                    _add_unique(auth_countries, f"{name} ({iso})")
-                elif name:
-                    _add_unique(auth_countries, name)
-                elif iso:
-                    _add_unique(auth_countries, iso)
-
-            # ---- Window-scoped observations (Action Taken, Obtain Country, Indication)
+            # Window-scoped observations (Action Taken, Obtain Country, Indication)
             action_taken_vals: List[str] = []
             for act_code in win_findall('.//hl7:act[@classCode="ACT"][@moodCode="EVN"]/hl7:code'):
                 if (act_code.attrib.get('codeSystem') or '').strip() == ACTION_TAKEN_OID:
@@ -1363,7 +1312,8 @@ def extract_all_products(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
 
             obtain_countries: List[str] = []
             for cn in win_findall('.//hl7:country'):
-                _add_unique(obtain_countries, (cn.text or '').strip())
+                val = (cn.text or '').strip()
+                _add_unique(obtain_countries, val)
             obtain_country = '\n'.join([v for v in obtain_countries if has_value(v)])
 
             indications: List[str] = []
@@ -1391,41 +1341,24 @@ def extract_all_products(root: ET.Element, meddra_map: Optional[Dict[str, Dict[s
                         _add_unique(indications, frag)
             indication_txt = '\n'.join([v for v in indications if has_value(v)])
 
-            # Joiners
             def join_vals(lst: List[str]) -> str:
                 return "\n".join([v for v in lst if has_value(v)])
 
             out.append({
                 'Drug': title,
-                'Product ID': pid,  # (kept internally; hidden in UI)
                 'Type': type_disp,
                 'Dosage Text': join_vals(dosage_texts),
                 'Dose Value': join_vals(dose_vals),
                 'Dose Unit': join_vals(dose_units),
                 'Start Date': join_vals(start_dates),
                 'Stop Date': join_vals(stop_dates),
-                'Frequency': join_vals(frequencies),
                 'Route': join_vals(routes),
                 'Formulation': join_vals(forms),
                 'Lot No': join_vals(lots),
-
-                'Name Qualifier(s)': join_vals(name_qualifiers),
-                'Active Ingredient(s)': join_vals(active_ingredients),
-
-                'MAH': join_vals(mahs),  # (kept internally; hidden in UI)
-                'Authorization Holder': join_vals(auth_holders),
-                'Authorization No': join_vals(auth_nos),
-                'Authorization Country': join_vals(auth_countries),
-
-                'Supply Type': join_vals(supply_types),  # (kept internally; hidden in UI)
-                'Cumulative Dose to Reaction': join_vals(cumulative_dose_rxn),
-                'Additional Information': join_vals(additional_info),
-                'Coded Drug Information': join_vals(coded_drug_info),
-
+                'MAH': join_vals(mahs),
                 'Action Taken': action_taken,
                 'Drug Obtain Country': obtain_country,
                 'Indication': indication_txt,
-
                 '_gid': f"pid::{pid.lower()}",
                 '_pid': pid,
             })
@@ -1644,9 +1577,11 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str, st
             if code_el is None or (code_el.attrib.get('displayName') or '').strip().lower() != 'reaction':
                 continue
 
+            # Raw LLT code (from value/@code)
             val_el = rxn.find('hl7:value', NS)
             llt_code = (val_el.attrib.get('code') or '').strip() if val_el is not None else ''
 
+            # Decide what to display for the Event term
             event_term = ""
             if meddra_map and llt_code in meddra_map:
                 event_term = (meddra_map[llt_code].get("LLT Term") or '').strip()
@@ -1659,12 +1594,14 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str, st
             if not event_term:
                 event_term = llt_code
 
+            # RRT
             rrt_term = ""
             if val_el is not None:
                 ot = val_el.find('hl7:originalText', NS)
                 if ot is not None and (ot.text or '').strip():
                     rrt_term = ot.text.strip()
 
+            # Seriousness
             flags: List[str] = []
             for crit, label in seriousness_map.items():
                 crit_el = rxn.find(f'.//hl7:code[@displayName="{crit}"]/../hl7:value', NS)
@@ -1672,10 +1609,12 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str, st
                     flags.append(label)
             seriousness_disp = "Non-serious" if not flags else ", ".join(sorted(set(flags)))
 
+            # Outcome
             outcome_el = rxn.find('.//hl7:code[@displayName="outcome"]/../hl7:value', NS)
             outcome_code = (outcome_el.attrib.get('code') or '').strip() if outcome_el is not None else ''
             outcome = outcome_map.get(outcome_code, "Unknown" if outcome_code else "")
 
+            # Dates
             low = rxn.find('.//hl7:effectiveTime/hl7:low', NS)
             high = rxn.find('.//hl7:effectiveTime/hl7:high', NS)
             start_raw = (low.attrib.get('value') or '').strip() if low is not None else ''
@@ -1683,11 +1622,13 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str, st
             start_disp = format_date(start_raw)
             end_disp = format_date(end_raw)
 
+            # Country
             country = ""
             loc_code = rxn.find('.//hl7:location//hl7:locatedPlace//hl7:code', NS)
             if loc_code is not None and (loc_code.attrib.get('code') or '').strip():
                 country = loc_code.attrib.get('code').strip()
 
+            # Translation term
             translation_term = ""
             for ob in rxn.findall('.//hl7:outboundRelationship2[@typeCode="PERT"]/hl7:observation', NS):
                 c = ob.find('hl7:code', NS)
@@ -1701,6 +1642,7 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str, st
                         translation_term = v.text.strip()
                         break
 
+            # Highlighted by reporter
             highlighted = ""
             for ob in rxn.findall('.//hl7:outboundRelationship2[@typeCode="PERT"]/hl7:observation', NS):
                 c = ob.find('hl7:code', NS)
@@ -1719,6 +1661,7 @@ def extract_events(root: ET.Element, meddra_map: Optional[Dict[str, Dict[str, st
                         highlighted = code_val
                     break
 
+            # Stable key
             key = normalize_text(event_term) or normalize_text(rrt_term) or clean_value(llt_code)
             if not key:
                 continue
@@ -1816,7 +1759,7 @@ def make_admin_table(src: Dict[str, Any], prc: Dict[str, Any]) -> pd.DataFrame:
     parts = [df for df in parts if not df.empty]
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["Field", "Source", "Processed"])
 
-
+# ✅ Reporter table builder
 def make_reporter_pair_table(src_rep: Dict[str, Any], prc_rep: Dict[str, Any]) -> pd.DataFrame:
     fields_in_order = [
         "Reporter IDs",
@@ -1837,7 +1780,7 @@ def make_reporter_pair_table(src_rep: Dict[str, Any], prc_rep: Dict[str, Any]) -
     rows = [(label, src_rep.get(label, ""), prc_rep.get(label, "")) for label in fields_in_order]
     return compare_table(rows, treat_as_dates=False)
 
-
+# ✅ Patient table in requested order
 def make_patient_table(src_pat: Dict[str, str], prc_pat: Dict[str, str]) -> pd.DataFrame:
     fields = [
         "Initials",
@@ -1864,7 +1807,6 @@ def _drug_match_key(rec: Dict[str, Any]) -> str:
     gid = (rec.get("_gid") or '').strip().lower()
     return gid or "unknown"
 
-
 def index_by_match_key(products: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     idx: Dict[str, Dict[str, Any]] = {}
     for rec in products:
@@ -1873,34 +1815,10 @@ def index_by_match_key(products: List[Dict[str, Any]]) -> Dict[str, Dict[str, An
             idx[key] = rec
     return idx
 
-
 def make_drug_compare_table(src_rec: Dict[str, Any], prc_rec: Dict[str, Any]) -> pd.DataFrame:
-    # NOTE: Hidden in UI (but extracted): MAH, Supply Type, Product ID
     fields = [
-        "Type",
-        # "Product ID",  # hidden
-        "Dosage Text",
-        "Dose Value",
-        "Dose Unit",
-        "Start Date",
-        "Stop Date",
-        "Frequency",
-        "Route",
-        "Formulation",
-        "Lot No",
-        "Name Qualifier(s)",
-        "Active Ingredient(s)",
-        # "MAH",  # hidden
-        "Authorization Holder",
-        "Authorization No",
-        "Authorization Country",
-        # "Supply Type",  # hidden
-        "Cumulative Dose to Reaction",
-        "Additional Information",
-        "Coded Drug Information",
-        "Action Taken",
-        "Drug Obtain Country",
-        "Indication",
+        "Type", "Dosage Text", "Dose Value", "Dose Unit", "Start Date", "Stop Date",
+        "Route", "Formulation", "Lot No", "MAH", "Action Taken", "Drug Obtain Country", "Indication",
     ]
     rows = [(f, src_rec.get(f, ''), prc_rec.get(f, '')) for f in fields]
     return compare_table(rows, treat_as_dates=False)
@@ -1991,16 +1909,8 @@ def make_drughist_box_for_ui(src_rec: Dict[str, Any], prc_rec: Dict[str, Any], t
         ("Drug", src_rec.get("Drug", ""), prc_rec.get("Drug", "")),
         ("Indication", src_rec.get("Indication", ""), prc_rec.get("Indication", "")),
         ("Reaction", src_rec.get("Reaction", ""), prc_rec.get("Reaction", "")),
-        (
-            "Start Date",
-            src_rec.get("Start Date", "") or format_date(src_rec.get("Start Date (raw)", "")),
-            prc_rec.get("Start Date", "") or format_date(prc_rec.get("Start Date (raw)", "")),
-        ),
-        (
-            "End Date",
-            src_rec.get("End Date", "") or format_date(src_rec.get("End Date (raw)", "")),
-            prc_rec.get("End Date", "") or format_date(prc_rec.get("End Date (raw)", "")),
-        ),
+        ("Start Date", src_rec.get("Start Date", ""), prc_rec.get("Start Date", "")),
+        ("End Date", src_rec.get("End Date", ""), prc_rec.get("End Date", "")),
     ]
     df = compare_table(rows, treat_as_dates=True)
     if not df.empty:
@@ -2020,6 +1930,8 @@ else:
 
 # 5) Medical History (after Drug History)
 st.subheader("Medical History")
+
+# Death Details mini-box at top of this section
 src_dd = src.get("DeathDetails", {}) or {}
 prc_dd = prc.get("DeathDetails", {}) or {}
 
@@ -2037,6 +1949,7 @@ if not dd_df.empty:
     st.table(dd_df)
     st.markdown('<div style="height:0.5rem;"></div>', unsafe_allow_html=True)
 
+# Existing Medical History items
 src_mh = src.get("MedicalHistory", []) or []
 prc_mh = prc.get("MedicalHistory", []) or []
 
