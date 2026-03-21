@@ -431,8 +431,11 @@ def extract_patient(root: ET.Element) -> Dict[str, str]:
     if ag_elem is not None:
         c = ag_elem.attrib.get('code', '')
         nf = ag_elem.attrib.get('nullFlavor', '')
-        age_group = age_group_map.get(c, "[Masked/Unknown]\" if (c in [\"MSK\", \"UNK\", \"ASKU\", \"NI\"] or nf in [\"MSK\", \"UNK\", \"ASKU\", \"NI\"]) else \"\")  # noqa
-
+        age_group = age_group_map.get(
+            c,
+            "[Masked/Unknown]" if (c in ["MSK", "UNK", "ASKU", "NI"] or nf in ["MSK", "UNK", "ASKU", "NI"]) else ""
+        )    
+    
     # Weight
     w_el = find_first(root, './/hl7:code[@displayName="bodyWeight"]/../hl7:value')
     w_val = w_el.attrib.get('value', '') if w_el is not None else ''
